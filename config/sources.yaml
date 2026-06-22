@@ -1,0 +1,32 @@
+# Ingestion source configuration (consumed in M1).
+# The ticker universe seeds the `entities` table; collectors only link
+# documents to entities that exist here.
+
+universe:
+  - { ticker: NVDA, name: "NVIDIA Corporation", sector: Technology }
+  - { ticker: AAPL, name: "Apple Inc.", sector: Technology }
+  - { ticker: TSLA, name: "Tesla, Inc.", sector: "Consumer Discretionary" }
+  - { ticker: AMD,  name: "Advanced Micro Devices", sector: Technology }
+  - { ticker: AMZN, name: "Amazon.com, Inc.", sector: "Consumer Discretionary" }
+
+reddit:
+  subreddits:
+    - wallstreetbets
+    - stocks
+    - investing
+    - StockMarket
+  post_limit: 200
+
+rss:
+  feeds:
+    - https://feeds.a.dj.com/rss/RSSMarketsMain.xml
+    - https://www.cnbc.com/id/100003114/device/rss/rss.html
+    - https://feeds.content.dowjones.io/public/rss/mw_topstories
+
+yahoo:
+  # Pulled from `universe` tickers; interval/period for OHLCV.
+  period: "1y"
+  interval: "1d"
+
+kaggle:
+  datasets: []  # add slugs like "owner/dataset-name" as needed

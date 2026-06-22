@@ -1,0 +1,8 @@
+# Normalize line endings to LF in the repo; check out native on each OS.
+* text=auto eol=lf
+
+# Binary / lock files: leave untouched
+uv.lock text eol=lf
+*.png binary
+*.pt binary
+*.bin binary

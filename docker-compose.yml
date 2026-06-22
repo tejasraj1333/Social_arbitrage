@@ -1,0 +1,40 @@
+# Local stack: API + Postgres(pgvector). Worker/scheduler added in M1.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: sam
+      POSTGRES_PASSWORD: sam
+      POSTGRES_DB: sam
+    ports:
+      # Host 5433 -> container 5432, avoiding clashes with a host-native
+      # Postgres on 5432. In-compose services still reach it as db:5432.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sam -d sam"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SAM_ENV: docker
+      SAM_DB__HOST: db
+      SAM_DB__USER: sam
+      SAM_DB__PASSWORD: sam
+      SAM_DB__NAME: sam
+    ports:
+      - "8000:8000"
+    # Run migrations, then serve.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn sam.api.app:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  pgdata:

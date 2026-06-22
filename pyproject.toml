@@ -1,0 +1,100 @@
+[project]
+name = "social-arbitrage-model"
+version = "0.1.0"
+description = "Detect attention & sentiment shifts before they hit earnings or price (Social Arbitrage Index)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "SAM" }]
+
+# Core runtime deps only. Heavy ML libs live in optional groups so the
+# API image stays slim and CI is fast. Install groups as milestones land.
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "alembic>=1.13",
+    "pgvector>=0.3",
+    "structlog>=24.1",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "tenacity>=8.4",
+]
+
+[project.optional-dependencies]
+ingestion = [
+    "praw>=7.7",          # Reddit
+    "feedparser>=6.0",    # RSS
+    "yfinance>=0.2.40",   # Yahoo Finance
+    "kaggle>=1.6",        # Kaggle datasets
+    "pandas>=2.2",
+]
+nlp = [
+    "sentence-transformers>=3.0",
+    "transformers>=4.42",
+    "torch>=2.3",
+    "bertopic>=0.16",
+    "scikit-learn>=1.5",
+]
+forecasting = [
+    "xgboost>=2.1",
+    "lightgbm>=4.4",
+    "numpy>=1.26",
+    "pandas>=2.2",
+]
+llm = [
+    "anthropic>=0.31",    # Claude for report narration (hybrid)
+]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+    "types-pyyaml>=6.0",
+]
+
+[project.scripts]
+sam = "sam.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sam"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "ASYNC"]
+ignore = ["B008"]  # FastAPI Depends() in defaults is idiomatic
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+explicit_package_bases = true
+namespace_packages = true
+
+[[tool.mypy.overrides]]
+module = ["yfinance.*", "praw.*", "feedparser.*", "bertopic.*", "pgvector.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --cov=sam --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["sam"]
+omit = ["*/migrations/*"]

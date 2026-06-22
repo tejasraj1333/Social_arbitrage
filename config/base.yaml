@@ -1,0 +1,10 @@
+# Non-secret defaults, committed. Secrets/overrides come from env (SAM_*).
+env: local
+log_level: INFO
+log_json: true
+
+db:
+  host: localhost
+  port: 5432
+  user: sam
+  name: sam

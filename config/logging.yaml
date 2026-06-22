@@ -1,0 +1,4 @@
+# Reserved for stdlib logging dictConfig overrides if needed.
+# Default logging is configured programmatically in sam.core.logging.
+version: 1
+disable_existing_loggers: false
