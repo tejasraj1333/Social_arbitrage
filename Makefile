@@ -1,4 +1,4 @@
-.PHONY: install lint format type test check migrate revision up down serve
+.PHONY: install lint format format-check type test check migrate revision up down serve
 
 install:        ## Sync deps (incl. dev) via uv
 	uv sync --extra dev
@@ -9,13 +9,16 @@ lint:           ## Ruff lint
 format:         ## Ruff format
 	uv run ruff format src tests
 
+format-check:   ## Ruff format check (no writes)
+	uv run ruff format --check src tests
+
 type:           ## mypy strict
 	uv run mypy src
 
 test:           ## Run tests with coverage
 	uv run pytest
 
-check: lint type test  ## Full local gate (mirrors CI)
+check: lint format-check type test  ## Full local gate (mirrors CI)
 
 migrate:        ## Apply migrations
 	uv run alembic upgrade head

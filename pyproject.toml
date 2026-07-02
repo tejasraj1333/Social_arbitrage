@@ -86,7 +86,16 @@ explicit_package_bases = true
 namespace_packages = true
 
 [[tool.mypy.overrides]]
-module = ["yfinance.*", "praw.*", "feedparser.*", "bertopic.*", "pgvector.*"]
+module = [
+    "yfinance.*",
+    "praw.*",
+    "feedparser.*",
+    "bertopic.*",
+    "pgvector.*",
+    "kaggle.*",
+    "pandas.*",
+    "numpy.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -15,6 +15,10 @@ class ConfigError(SAMError):
     """Invalid or missing configuration."""
 
 
+class CredentialsMissing(ConfigError):
+    """A source's API credentials are absent; the collector cannot run live."""
+
+
 class IngestionError(SAMError):
     """A collector failed to fetch or persist data."""
 

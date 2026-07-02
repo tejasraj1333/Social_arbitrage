@@ -1,0 +1,6 @@
+source,status,record_count,schema_completeness,freshness_hours,estimated_monthly_volume,collection_difficulty,recommended
+rss,ok,100,1.0,0.11,70.0,low,True
+yahoo,ok,1255,1.0,34.07,103.0,low,True
+hackernews,ok,100,0.99,1.51,1135.0,low,True
+reddit,needs_credentials,0,0.0,,,medium,False
+kaggle,needs_credentials,0,0.0,,,medium,False

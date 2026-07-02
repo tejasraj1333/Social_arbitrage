@@ -1,6 +1,6 @@
-# Ingestion source configuration (consumed in M1).
-# The ticker universe seeds the `entities` table; collectors only link
-# documents to entities that exist here.
+# Ingestion source configuration.
+# The ticker universe seeds the `entities` table (M1); collectors only link
+# documents to entities that exist here. Phase-1 recon reads this file too.
 
 universe:
   - { ticker: NVDA, name: "NVIDIA Corporation", sector: Technology }
@@ -14,19 +14,39 @@ reddit:
     - wallstreetbets
     - stocks
     - investing
-    - StockMarket
   post_limit: 200
 
 rss:
+  # (name, url) pairs so the recon `source` field is human-readable.
+  # Reuters retired its public RSS feeds; kept as a candidate but the collector
+  # tolerates dead feeds and backfills from the others to reach the sample target.
   feeds:
-    - https://feeds.a.dj.com/rss/RSSMarketsMain.xml
-    - https://www.cnbc.com/id/100003114/device/rss/rss.html
-    - https://feeds.content.dowjones.io/public/rss/mw_topstories
+    # Primary feeds named in the Phase-1 spec.
+    - { name: "CNBC",            url: "https://www.cnbc.com/id/100003114/device/rss/rss.html" }
+    - { name: "MarketWatch",     url: "https://feeds.content.dowjones.io/public/rss/mw_topstories" }
+    - { name: "Reuters Markets", url: "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best" }
+    # Supplementary market feeds so the sample reaches its target even when a
+    # primary feed is down (Reuters retired its public RSS). Deduped by URL.
+    - { name: "WSJ Markets",     url: "https://feeds.a.dj.com/rss/RSSMarketsMain.xml" }
+    - { name: "CNBC Markets",    url: "https://www.cnbc.com/id/20910258/device/rss/rss.html" }
+    - { name: "CNBC Investing",  url: "https://www.cnbc.com/id/15839069/device/rss/rss.html" }
+    - { name: "CNBC Finance",    url: "https://www.cnbc.com/id/10000664/device/rss/rss.html" }
+    - { name: "Nasdaq Markets",  url: "https://www.nasdaq.com/feed/rssoutbound?category=Markets" }
 
 yahoo:
-  # Pulled from `universe` tickers; interval/period for OHLCV.
+  # Phase-1 recon universe (per Phase 1 spec); period/interval for OHLCV.
+  universe: [AAPL, MSFT, NVDA, TSLA, AMZN]
   period: "1y"
   interval: "1d"
 
+hackernews:
+  # How many top stories to pull for the recon sample.
+  limit: 100
+
 kaggle:
-  datasets: []  # add slugs like "owner/dataset-name" as needed
+  datasets: []  # explicit slugs like "owner/dataset-name" (M1), if needed
+  # Metadata-only search terms the Phase-1 evaluator scores candidates against.
+  search_terms:
+    - reddit
+    - finance
+    - news
