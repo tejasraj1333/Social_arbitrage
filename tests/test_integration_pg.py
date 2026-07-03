@@ -22,10 +22,14 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from sam.core.db import Base
-from sam.storage.models import Document, MarketData
+from sam.processing.pipeline import ResolutionPipeline
+from sam.processing.quality import DataQualityRunner
+from sam.storage.models import DataQualityCheck, Document, DocumentEntity, MarketData
 from sam.storage.repositories import (
+    DocumentEntityRepository,
     DocumentRepository,
     EntityRepository,
+    IngestionRunRepository,
     MarketDataRepository,
     SourceRepository,
 )
@@ -63,7 +67,15 @@ def pg_session(pg_engine) -> Iterator[Session]:
         yield session
         session.rollback()
         # Clean tables between tests (order respects FKs).
-        for table in ("ingestion_runs", "documents", "market_data", "sources", "entities"):
+        for table in (
+            "data_quality_checks",
+            "document_entities",
+            "ingestion_runs",
+            "documents",
+            "market_data",
+            "sources",
+            "entities",
+        ):
             session.execute(text(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE"))
         session.commit()
 
@@ -125,3 +137,90 @@ def test_entity_seed_idempotent_on_postgres(pg_session: Session) -> None:
     assert repo.seed(universe) == 1
     assert repo.seed(universe) == 0
     pg_session.commit()
+
+
+def _pg_doc(source_id: int, hash_: str, title: str) -> dict[str, object]:
+    return {
+        "source_id": source_id,
+        "external_id": hash_[:8],
+        "url": f"https://x/{hash_[:8]}",
+        "author": None,
+        "title": title,
+        "raw_text": None,
+        "lang": None,
+        "content_hash": hash_,
+        "published_at": None,
+        "engagement": {},
+    }
+
+
+def test_document_entity_upsert_do_update_on_postgres(pg_session: Session) -> None:
+    source = SourceRepository(pg_session).get_or_create("rss", "rss")
+    EntityRepository(pg_session).seed([{"ticker": "NVDA", "name": "NVIDIA Corporation"}])
+    ids = EntityRepository(pg_session).by_ticker()
+    DocumentRepository(pg_session).upsert_many([_pg_doc(source.id, "a" * 64, "Nvidia rises")])
+    doc_id = pg_session.execute(select(Document.id)).scalar_one()
+
+    repo = DocumentEntityRepository(pg_session)
+    now = datetime.now(tz=UTC)
+    link = {
+        "document_id": doc_id,
+        "entity_id": ids["NVDA"],
+        "confidence": 0.8,
+        "method": "alias",
+        "resolved_at": now,
+    }
+    assert repo.upsert_many([link]) == 1
+    # Re-resolution refreshes the link (real Postgres ON CONFLICT DO UPDATE).
+    assert repo.upsert_many([dict(link, confidence=1.0, method="cashtag")]) == 1
+    pg_session.commit()
+
+    stored = pg_session.execute(select(DocumentEntity)).scalar_one()
+    assert (stored.confidence, stored.method) == (1.0, "cashtag")
+
+
+def test_resolution_pipeline_on_postgres(pg_session: Session) -> None:
+    source = SourceRepository(pg_session).get_or_create("rss", "rss")
+    # aliases exercise the Postgres text[] column end-to-end through the matcher.
+    EntityRepository(pg_session).seed(
+        [{"ticker": "NVDA", "name": "NVIDIA Corporation", "aliases": ["Nvidia"]}]
+    )
+    DocumentRepository(pg_session).upsert_many(
+        [
+            _pg_doc(source.id, "b" * 64, "Nvidia extends its AI lead"),
+            _pg_doc(source.id, "c" * 64, "Fed leaves rates unchanged"),
+        ]
+    )
+    pg_session.commit()
+
+    pipeline = ResolutionPipeline(session_factory=lambda: pg_session)
+    result = pipeline.run()
+    assert result.docs_scanned == 2
+    assert result.links_written == 1
+    assert pipeline.run().docs_scanned == 0  # watermark works on timestamptz
+
+    unresolved = pg_session.execute(
+        select(Document).where(Document.resolved_at.is_(None))
+    ).scalars()
+    assert list(unresolved) == []
+
+
+def test_dq_runner_persists_on_postgres(pg_session: Session) -> None:
+    source = SourceRepository(pg_session).get_or_create("rss", "rss")
+    runs = IngestionRunRepository(pg_session)
+    runs.finish(runs.start(source.id), status="success", rows_fetched=7)
+    DocumentRepository(pg_session).upsert_many(
+        [_pg_doc(source.id, "d" * 64, "Nvidia rises on record data-center demand")]
+    )
+    pg_session.commit()
+
+    outcomes = DataQualityRunner(session_factory=lambda: pg_session).run()
+    assert {o.check_name for o in outcomes} == {
+        "duplicate_rate",
+        "freshness",
+        "volume_anomaly",
+        "resolution_coverage",
+    }
+    rows = pg_session.execute(select(DataQualityCheck)).scalars().all()
+    assert len(rows) == len(outcomes)
+    assert all(isinstance(row.details, dict) for row in rows)  # JSONB round-trip

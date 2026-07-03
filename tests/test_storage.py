@@ -1,7 +1,8 @@
-"""Schema round-trip tests for the Phase-2 tables (in-memory SQLite).
+"""Schema round-trip tests for the Phase-2/3 tables (in-memory SQLite).
 
 The models declare portable column types, so the same ORM definitions run on
-SQLite here and on Postgres in production (DDL canonicalized by migration 0002).
+SQLite here and on Postgres in production (DDL canonicalized by migrations
+0002/0003).
 """
 
 from __future__ import annotations
@@ -9,11 +10,19 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from sam.storage.models import Document, Entity, IngestionRun, MarketData, Source
+from sam.storage.models import (
+    DataQualityCheck,
+    Document,
+    DocumentEntity,
+    Entity,
+    IngestionRun,
+    MarketData,
+    Source,
+)
 
 
 @pytest.fixture
@@ -85,9 +94,10 @@ def test_market_data_composite_pk(session: Session) -> None:
     )
     session.add(bar)
     session.commit()
-    session.add(MarketData(entity_id=ent.id, date=date(2026, 7, 1), close=9.9))
+    # Core insert: dodges the ORM identity map so the DB constraint itself fires.
+    dup = insert(MarketData).values(entity_id=ent.id, date=date(2026, 7, 1), close=9.9)
     with pytest.raises(IntegrityError):  # same (entity_id, date) key
-        session.commit()
+        session.execute(dup)
     session.rollback()
 
 
@@ -109,3 +119,71 @@ def test_ingestion_run_lifecycle_fields(session: Session) -> None:
     session.commit()
     loaded = session.execute(select(IngestionRun)).scalar_one()
     assert loaded.rows_inserted == 42
+
+
+def _doc_and_entity(session: Session) -> tuple[Document, Entity]:
+    src = Source(type="rss", name="rss")
+    ent = Entity(ticker="NVDA", name="NVIDIA Corporation", aliases=["Nvidia"])
+    session.add_all([src, ent])
+    session.flush()
+    doc = Document(source_id=src.id, title="Nvidia pops", content_hash="d" * 64)
+    session.add(doc)
+    session.flush()
+    return doc, ent
+
+
+def test_document_entity_round_trip_and_composite_pk(session: Session) -> None:
+    doc, ent = _doc_and_entity(session)
+    link = DocumentEntity(document_id=doc.id, entity_id=ent.id, confidence=0.9, method="ticker")
+    session.add(link)
+    session.commit()
+
+    loaded = session.execute(select(DocumentEntity)).scalar_one()
+    assert (loaded.document_id, loaded.entity_id) == (doc.id, ent.id)
+    assert loaded.resolved_at is not None  # server default applied
+
+    # Core insert: dodges the ORM identity map so the DB constraint itself fires.
+    dup = insert(DocumentEntity).values(
+        document_id=doc.id, entity_id=ent.id, confidence=1.0, method="cashtag"
+    )
+    with pytest.raises(IntegrityError):  # same (document_id, entity_id) key
+        session.execute(dup)
+    session.rollback()
+
+
+def test_document_entity_requires_valid_fks(session: Session) -> None:
+    session.add(DocumentEntity(document_id=999, entity_id=999, confidence=0.5, method="alias"))
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+
+def test_document_resolved_at_defaults_null(session: Session) -> None:
+    doc, _ = _doc_and_entity(session)
+    session.commit()
+    assert doc.resolved_at is None  # unresolved until the resolver scans it
+
+
+def test_data_quality_check_round_trip(session: Session) -> None:
+    check = DataQualityCheck(
+        check_name="duplicate_rate",
+        source_name="rss",
+        status="pass",
+        value=0.004,
+        threshold=0.02,
+        details={"near_dup_pairs": [[1, 2]]},
+    )
+    session.add(check)
+    session.commit()
+
+    loaded = session.execute(select(DataQualityCheck)).scalar_one()
+    assert loaded.status == "pass"
+    assert loaded.details == {"near_dup_pairs": [[1, 2]]}
+    assert loaded.ran_at is not None
+
+
+def test_data_quality_check_rejects_unknown_status(session: Session) -> None:
+    session.add(DataQualityCheck(check_name="freshness", status="bogus"))
+    with pytest.raises(IntegrityError):  # CHECK constraint
+        session.commit()
+    session.rollback()

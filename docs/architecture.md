@@ -46,7 +46,7 @@ sources(id, type, name, config_ref)
 documents(id, source_id, external_id, url, author,
           content_hash UNIQUE, raw_text, lang,
           published_at, ingested_at, engagement JSONB)
-document_entities(document_id, entity_id, confidence)
+document_entities(document_id, entity_id, confidence, method, resolved_at)
 sentiment_scores(document_id, model, label, score, scored_at)
 topics(id, topic_model_version, label, keywords[], created_at)
 document_topics(document_id, topic_id, probability)
@@ -57,6 +57,8 @@ market_data(entity_id, date, open, high, low, close, adj_close, volume)
 forecasts(entity_id, date, horizon, model_version, yhat, yhat_low, yhat_high)
 reports(id, entity_id, period, content, model, created_at)
 ingestion_runs(id, source_id, started_at, finished_at, rows, status, error)
+data_quality_checks(id, check_name, source_name, status, value, threshold,
+                    details JSONB, ran_at)
 model_registry(id, name, version, metrics JSONB, path, created_at)
 ```
 

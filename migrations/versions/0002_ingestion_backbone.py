@@ -66,9 +66,7 @@ def upgrade() -> None:
 
     op.create_table(
         "market_data",
-        sa.Column(
-            "entity_id", sa.Integer(), sa.ForeignKey("entities.id"), primary_key=True
-        ),
+        sa.Column("entity_id", sa.Integer(), sa.ForeignKey("entities.id"), primary_key=True),
         sa.Column("date", sa.Date(), primary_key=True),
         sa.Column("open", sa.Float(), nullable=True),
         sa.Column("high", sa.Float(), nullable=True),

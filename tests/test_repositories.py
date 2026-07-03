@@ -63,6 +63,38 @@ def test_entity_seed_idempotent_and_preserves_existing(db_session: Session) -> N
     assert set(repo.by_ticker()) == {"AAPL", "MSFT"}
 
 
+def test_entity_seed_update_refreshes_curated_fields(db_session: Session) -> None:
+    repo = EntityRepository(db_session)
+    repo.seed(UNIVERSE)
+    db_session.commit()
+
+    # Config gains aliases; --update pushes them onto existing rows and still
+    # inserts brand-new tickers in the same statement.
+    curated = [
+        {"ticker": "AAPL", "name": "Apple Inc.", "sector": "Technology", "aliases": ["Apple"]},
+        {"ticker": "MSFT", "name": "Microsoft Corporation", "aliases": ["Microsoft"]},
+        {"ticker": "NVDA", "name": "NVIDIA Corporation", "aliases": ["Nvidia"]},
+    ]
+    written = repo.seed(curated, update=True)
+    db_session.commit()
+    assert written == 3  # 2 updated + 1 inserted
+
+    apple = db_session.execute(select(Entity).where(Entity.ticker == "AAPL")).scalar_one()
+    assert apple.aliases == ["Apple"]
+    assert set(repo.by_ticker()) == {"AAPL", "MSFT", "NVDA"}
+
+
+def test_entity_active_returns_ticker_ordered_active_rows(db_session: Session) -> None:
+    repo = EntityRepository(db_session)
+    repo.seed(UNIVERSE)
+    msft = db_session.execute(select(Entity).where(Entity.ticker == "MSFT")).scalar_one()
+    msft.active = False
+    db_session.flush()
+
+    active = repo.active()
+    assert [e.ticker for e in active] == ["AAPL"]
+
+
 def test_document_upsert_is_idempotent(db_session: Session) -> None:
     SourceRepository(db_session).get_or_create("rss", "rss")
     repo = DocumentRepository(db_session)

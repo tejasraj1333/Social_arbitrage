@@ -7,6 +7,8 @@ Expands per milestone. Currently exposes:
   sam seed                        seed entities from config/sources.yaml
   sam ingest [--source SOURCE] [--backfill] [--loop SECONDS]
                                   run production ingestion (Phase 2)
+  sam resolve [--all|--evaluate]  link documents to entities (Phase 3)
+  sam dq                          run data-quality checks (Phase 3)
   sam runs [--limit N]            show recent ingestion runs
 """
 
@@ -38,7 +40,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Source to recon; 'all' (default) runs every collector and writes the scorecard.",
     )
 
-    sub.add_parser("seed", help="Seed the entities table from config/sources.yaml")
+    seed = sub.add_parser("seed", help="Seed the entities table from config/sources.yaml")
+    seed.add_argument(
+        "--update",
+        action="store_true",
+        help="Also refresh name/sector/aliases of existing tickers from config "
+        "(config is the curation source; run after editing aliases).",
+    )
 
     ingest = sub.add_parser("ingest", help="Run production ingestion collector(s)")
     ingest.add_argument(
@@ -61,6 +69,21 @@ def main(argv: list[str] | None = None) -> int:
         "(prefer cron/Task Scheduler in production).",
     )
 
+    resolve = sub.add_parser("resolve", help="Link documents to entities (entity resolution)")
+    resolve.add_argument(
+        "--all",
+        action="store_true",
+        help="Re-scan already-resolved documents too (after changing aliases in config).",
+    )
+    resolve.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Score the resolver against the labeled sample (data/eval) instead of "
+        "resolving; exits non-zero if precision drops below the 0.90 gate.",
+    )
+
+    sub.add_parser("dq", help="Run data-quality checks and record the results")
+
     runs = sub.add_parser("runs", help="Show recent ingestion runs (observability)")
     runs.add_argument("--limit", type=int, default=20, help="How many runs to show.")
 
@@ -77,10 +100,18 @@ def main(argv: list[str] | None = None) -> int:
         return _run_recon(args.source)
 
     if args.command == "seed":
-        return _run_seed()
+        return _run_seed(update=args.update)
 
     if args.command == "ingest":
         return _run_ingest(args.source, backfill=args.backfill, loop_seconds=args.loop)
+
+    if args.command == "resolve":
+        if args.evaluate:
+            return _run_evaluate()
+        return _run_resolve(re_resolve=args.all)
+
+    if args.command == "dq":
+        return _run_dq()
 
     if args.command == "runs":
         return _show_runs(args.limit)
@@ -134,7 +165,7 @@ def _run_recon(source: str) -> int:
     return 1 if result.status == "error" else 0
 
 
-def _run_seed() -> int:
+def _run_seed(*, update: bool = False) -> int:
     """Seed the entities table from the configured ticker universe."""
     from sqlalchemy.exc import SQLAlchemyError
 
@@ -147,7 +178,7 @@ def _run_seed() -> int:
     try:
         session = runner_mod.default_session()
         try:
-            inserted = EntityRepository(session).seed(universe)
+            written = EntityRepository(session).seed(universe, update=update)
             session.commit()
         finally:
             session.close()
@@ -158,7 +189,7 @@ def _run_seed() -> int:
             hint="is Postgres up? (docker compose up -d db; SAM_DB__PORT=5433 for compose)",
         )
         return 1
-    logger.info("seed_done", requested=len(universe), inserted=inserted)
+    logger.info("seed_done", requested=len(universe), written=written, update=update)
     return 0
 
 
@@ -210,6 +241,75 @@ def _run_ingest(
         if max_cycles is not None and cycles >= max_cycles:
             return 1 if errored else 0
         time.sleep(loop_seconds)
+
+
+def _run_resolve(*, re_resolve: bool = False) -> int:
+    """Run the entity-resolution pipeline over ingested documents."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sam.processing import pipeline as pipeline_mod
+
+    logger = get_logger("sam.resolve")
+    try:
+        result = pipeline_mod.ResolutionPipeline().run(re_resolve=re_resolve)
+    except SQLAlchemyError as exc:
+        logger.error(
+            "resolve_db_error",
+            error=str(exc),
+            hint="is Postgres up? (docker compose up -d db; SAM_DB__PORT=5433 for compose)",
+        )
+        return 1
+    logger.info(
+        "resolve.complete",
+        scanned=result.docs_scanned,
+        matched=result.docs_matched,
+        links=result.links_written,
+    )
+    return 0
+
+
+def _run_evaluate() -> int:
+    """Score the resolver on the labeled sample; non-zero exit below the gate."""
+    from sam.processing.evaluate import PRECISION_GATE, evaluate
+
+    logger = get_logger("sam.evaluate")
+    report = evaluate()
+    for text, ticker in report.false_positives:
+        logger.warning("eval_false_positive", ticker=ticker, text=text[:120])
+    for text, ticker in report.false_negatives:
+        logger.warning("eval_false_negative", ticker=ticker, text=text[:120])
+    if not report.passes_gate:
+        logger.error("eval_gate_failed", precision=round(report.precision, 4), gate=PRECISION_GATE)
+        return 1
+    return 0
+
+
+def _run_dq() -> int:
+    """Run all data-quality checks; exit non-zero when any check fails."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sam.processing import quality as quality_mod
+
+    logger = get_logger("sam.dq")
+    try:
+        outcomes = quality_mod.DataQualityRunner().run()
+    except SQLAlchemyError as exc:
+        logger.error(
+            "dq_db_error",
+            error=str(exc),
+            hint="is Postgres up? (docker compose up -d db; SAM_DB__PORT=5433 for compose)",
+        )
+        return 1
+
+    header = f"{'check':<22} {'source':<12} {'status':<7} {'value':>10}  {'threshold':>9}"
+    print(header)
+    print("-" * len(header))
+    for o in outcomes:
+        value = f"{o.value:.4f}" if o.value is not None else "-"
+        threshold = f"{o.threshold:.2f}" if o.threshold is not None else "-"
+        source = o.source_name or "-"
+        print(f"{o.check_name:<22} {source:<12} {o.status:<7} {value:>10}  {threshold:>9}")
+    return 1 if any(o.status == "fail" for o in outcomes) else 0
 
 
 def _show_runs(limit: int) -> int:

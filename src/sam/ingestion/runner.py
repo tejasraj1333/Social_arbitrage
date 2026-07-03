@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from sam.core.db import get_engine
+from sam.core.db import default_session
 from sam.core.logging import get_logger
 from sam.ingestion import lake
 from sam.ingestion.base import Collector
@@ -83,9 +83,7 @@ class IngestResult:
     detail: str = ""
 
 
-def default_session() -> Session:
-    """Production session bound to the configured engine (CLI entry point)."""
-    return Session(get_engine(), expire_on_commit=False)
+__all__ = ["SOURCES", "IngestResult", "IngestionRunner", "SourceSpec", "default_session"]
 
 
 class IngestionRunner:

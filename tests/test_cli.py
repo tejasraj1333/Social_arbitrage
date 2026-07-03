@@ -140,6 +140,87 @@ def test_cli_seed_uses_config_universe(monkeypatch, db_session) -> None:
     assert {"AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "AMD"} == tickers
 
 
+def test_cli_seed_update_syncs_aliases_from_config(monkeypatch, db_session) -> None:
+    from sqlalchemy import select
+
+    from sam.ingestion import runner as runner_mod
+    from sam.storage.models import Entity
+
+    monkeypatch.setattr(runner_mod, "default_session", lambda: db_session)
+    assert main(["seed"]) == 0
+
+    # Wipe one row's aliases to simulate a pre-P3 database, then --update.
+    nvda = db_session.execute(select(Entity).where(Entity.ticker == "NVDA")).scalar_one()
+    nvda.aliases = []
+    db_session.commit()
+
+    assert main(["seed", "--update"]) == 0
+    refreshed = db_session.execute(select(Entity).where(Entity.ticker == "NVDA")).scalar_one()
+    assert refreshed.aliases == ["Nvidia"]  # curated value from config/sources.yaml
+
+
+def test_cli_resolve_links_entities(monkeypatch, db_session) -> None:
+    from sqlalchemy import select
+
+    from sam.ingestion import runner as runner_mod
+    from sam.processing import pipeline as pipeline_mod
+    from sam.storage.models import DocumentEntity
+    from sam.storage.repositories import DocumentRepository, SourceRepository
+
+    monkeypatch.setattr(runner_mod, "default_session", lambda: db_session)
+    assert main(["seed"]) == 0
+
+    SourceRepository(db_session).get_or_create("rss", "rss")
+    DocumentRepository(db_session).upsert_many(
+        [
+            {
+                "source_id": 1,
+                "external_id": "x",
+                "url": "https://example.com/x",
+                "author": None,
+                "title": "Nvidia and $TSLA both rallied",
+                "raw_text": None,
+                "lang": None,
+                "content_hash": "e" * 64,
+                "published_at": None,
+                "engagement": {},
+            }
+        ]
+    )
+    db_session.commit()
+
+    # Pipeline resolves its factory lazily, so patching the module works.
+    monkeypatch.setattr(pipeline_mod, "default_session", lambda: db_session)
+    assert main(["resolve"]) == 0
+    links = db_session.execute(select(DocumentEntity)).scalars().all()
+    assert {link.method for link in links} == {"alias", "cashtag"}
+
+
+def test_cli_resolve_evaluate_passes_gate() -> None:
+    # Runs the real labeled sample against the config universe — no DB, no
+    # network. Exit 0 == precision gate met.
+    assert main(["resolve", "--evaluate"]) == 0
+
+
+def test_cli_dq_prints_table_and_persists(monkeypatch, db_session, capsys) -> None:
+    from sqlalchemy import select
+
+    from sam.processing import quality as quality_mod
+    from sam.storage.models import DataQualityCheck
+    from sam.storage.repositories import IngestionRunRepository, SourceRepository
+
+    source = SourceRepository(db_session).get_or_create("rss", "rss")
+    repo = IngestionRunRepository(db_session)
+    repo.finish(repo.start(source.id), status="success", rows_fetched=12)
+    db_session.commit()
+
+    monkeypatch.setattr(quality_mod, "default_session", lambda: db_session)
+    assert main(["dq"]) == 0
+    out = capsys.readouterr().out
+    assert "duplicate_rate" in out and "freshness" in out
+    assert db_session.execute(select(DataQualityCheck)).scalars().all()
+
+
 def test_cli_runs_prints_table(monkeypatch, db_session, capsys) -> None:
     from sam.ingestion import runner as runner_mod
     from sam.storage.repositories import IngestionRunRepository, SourceRepository

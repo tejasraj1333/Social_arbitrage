@@ -1,14 +1,26 @@
 # Ingestion source configuration.
 # The ticker universe seeds the `entities` table (M1); collectors only link
 # documents to entities that exist here. Phase-1 recon reads this file too.
+#
+# `aliases` feed the entity resolver (Phase 3): case-insensitive names the
+# press uses for the company. Curate conservatively — every alias is a
+# false-positive surface (precision is gated at >=90%). After editing, run
+# `sam seed --update` to sync curated fields into the DB, then
+# `sam resolve --all` to re-resolve with the new dictionary.
 
 universe:
-  - { ticker: NVDA, name: "NVIDIA Corporation", sector: Technology }
-  - { ticker: AAPL, name: "Apple Inc.", sector: Technology }
-  - { ticker: MSFT, name: "Microsoft Corporation", sector: Technology }
-  - { ticker: TSLA, name: "Tesla, Inc.", sector: "Consumer Discretionary" }
-  - { ticker: AMD,  name: "Advanced Micro Devices", sector: Technology }
-  - { ticker: AMZN, name: "Amazon.com, Inc.", sector: "Consumer Discretionary" }
+  - { ticker: NVDA, name: "NVIDIA Corporation", sector: Technology,
+      aliases: ["Nvidia"] }
+  - { ticker: AAPL, name: "Apple Inc.", sector: Technology,
+      aliases: ["Apple"] }
+  - { ticker: MSFT, name: "Microsoft Corporation", sector: Technology,
+      aliases: ["Microsoft"] }
+  - { ticker: TSLA, name: "Tesla, Inc.", sector: "Consumer Discretionary",
+      aliases: ["Tesla"] }
+  - { ticker: AMD,  name: "Advanced Micro Devices", sector: Technology,
+      aliases: [] }
+  - { ticker: AMZN, name: "Amazon.com, Inc.", sector: "Consumer Discretionary",
+      aliases: ["Amazon"] }
 
 reddit:
   subreddits:

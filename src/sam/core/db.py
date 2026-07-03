@@ -36,6 +36,15 @@ def _get_sessionmaker() -> sessionmaker[Session]:
     return sessionmaker(bind=get_engine(), expire_on_commit=False, future=True)
 
 
+def default_session() -> Session:
+    """Plain session on the configured engine (CLI / pipeline entry points).
+
+    Caller owns the lifecycle (commit/close) — unlike :func:`get_session`,
+    which is the FastAPI dependency with commit-on-success semantics.
+    """
+    return Session(get_engine(), expire_on_commit=False)
+
+
 def get_session() -> Iterator[Session]:
     """Yield a session, committing on success and rolling back on error.
 

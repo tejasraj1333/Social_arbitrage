@@ -14,14 +14,22 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import Table, select
+from sqlalchemy import Table, func, select, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
 from sam.core.db import Base
 from sam.core.errors import IngestionError
 from sam.core.logging import get_logger
-from sam.storage.models import Document, Entity, IngestionRun, MarketData, Source
+from sam.storage.models import (
+    DataQualityCheck,
+    Document,
+    DocumentEntity,
+    Entity,
+    IngestionRun,
+    MarketData,
+    Source,
+)
 
 log = get_logger("storage.repositories")
 
@@ -72,16 +80,23 @@ class SourceRepository:
         log.info("source_created", name=name, type=type_)
         return source
 
+    def all(self) -> list[Source]:
+        """Every registered source (DQ iterates these), name-ordered."""
+        return list(self.session.execute(select(Source).order_by(Source.name)).scalars())
+
 
 class EntityRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def seed(self, universe: list[dict[str, Any]]) -> int:
-        """Upsert the configured ticker universe; returns newly inserted count.
+    def seed(self, universe: list[dict[str, Any]], *, update: bool = False) -> int:
+        """Upsert the configured ticker universe; returns written-row count.
 
-        Existing rows are left untouched (curated fields like aliases must not
-        be clobbered by a re-seed).
+        Default (``update=False``): existing rows are left untouched — a plain
+        re-seed never clobbers the DB. With ``update=True`` the config is
+        treated as the curation source of truth and name/sector/aliases of
+        existing tickers are refreshed (``sam seed --update``, e.g. after
+        adding resolver aliases).
         """
         rows = [
             {
@@ -96,15 +111,34 @@ class EntityRepository:
         if not rows:
             return 0
         stmt = _insert_for(self.session, Entity).values(rows)
-        stmt = stmt.on_conflict_do_nothing(index_elements=["ticker"])
-        inserted = _written_count(self.session, stmt, Entity.__table__.c.id)
-        log.info("entities_seeded", requested=len(rows), inserted=inserted)
-        return inserted
+        if update:
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["ticker"],
+                set_={
+                    "name": stmt.excluded.name,
+                    "sector": stmt.excluded.sector,
+                    "aliases": stmt.excluded.aliases,
+                    "active": stmt.excluded.active,
+                },
+            )
+        else:
+            stmt = stmt.on_conflict_do_nothing(index_elements=["ticker"])
+        written = _written_count(self.session, stmt, Entity.__table__.c.id)
+        log.info("entities_seeded", requested=len(rows), written=written, update=update)
+        return written
 
     def by_ticker(self) -> dict[str, int]:
         """Map ticker -> entity id for the active universe."""
         result = self.session.execute(select(Entity.ticker, Entity.id))
         return dict(result.tuples().all())
+
+    def active(self) -> list[Entity]:
+        """Active entities, resolver-dictionary source (ticker order = stable)."""
+        return list(
+            self.session.execute(
+                select(Entity).where(Entity.active.is_(True)).order_by(Entity.ticker)
+            ).scalars()
+        )
 
 
 class DocumentRepository:
@@ -131,6 +165,83 @@ class DocumentRepository:
             stmt = stmt.on_conflict_do_nothing(index_elements=["content_hash"])
             inserted += _written_count(self.session, stmt, Document.__table__.c.id)
         return inserted
+
+    def resolution_batch(
+        self, *, after_id: int = 0, limit: int = 500, include_resolved: bool = False
+    ) -> list[Document]:
+        """Next id-ordered batch for the entity resolver (keyset pagination).
+
+        Default scans only unresolved documents (``resolved_at IS NULL``);
+        ``include_resolved=True`` is the ``sam resolve --all`` path after a
+        dictionary change. ``after_id`` guards against re-reading a batch
+        even if the caller's resolved-marking failed.
+        """
+        stmt = select(Document).where(Document.id > after_id).order_by(Document.id).limit(limit)
+        if not include_resolved:
+            stmt = stmt.where(Document.resolved_at.is_(None))
+        return list(self.session.execute(stmt).scalars())
+
+    def mark_resolved(self, document_ids: list[int], *, at: datetime) -> None:
+        """Stamp the resolver watermark — also for docs with zero matches."""
+        if not document_ids:
+            return
+        self.session.execute(
+            update(Document).where(Document.id.in_(document_ids)).values(resolved_at=at)
+        )
+
+    def recent_titles(self, limit: int = 1000) -> list[tuple[int, str | None]]:
+        """(id, title) of the most recent documents — the near-dup check window.
+
+        "Recent" by id, not timestamp: portable across SQLite/Postgres without
+        tz-comparison pitfalls, and ingestion order is what dedup cares about.
+        """
+        rows = self.session.execute(
+            select(Document.id, Document.title).order_by(Document.id.desc()).limit(limit)
+        ).tuples()
+        return list(rows)
+
+    def resolution_stats(self) -> tuple[int, int, int]:
+        """(total, unresolved, with_links) document counts for DQ coverage."""
+        total = self.session.execute(select(func.count(Document.id))).scalar_one()
+        unresolved = self.session.execute(
+            select(func.count(Document.id)).where(Document.resolved_at.is_(None))
+        ).scalar_one()
+        with_links = self.session.execute(
+            select(func.count(func.distinct(DocumentEntity.document_id)))
+        ).scalar_one()
+        return total, unresolved, with_links
+
+
+class DocumentEntityRepository:
+    """document→entity links — the resolver's output table."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_many(self, links: list[dict[str, Any]]) -> int:
+        """Upsert links on (document_id, entity_id); the latest resolution wins.
+
+        DO UPDATE (not DO NOTHING): re-resolving after a dictionary change
+        must refresh confidence/method/resolved_at. Intra-batch duplicates
+        collapse last-wins to match that semantics.
+        """
+        deduped: dict[tuple[int, int], dict[str, Any]] = {
+            (link["document_id"], link["entity_id"]): link for link in links
+        }
+        rows = list(deduped.values())
+        if not rows:
+            return 0
+
+        set_cols = ["confidence", "method", "resolved_at"]
+        written = 0
+        for chunk in _chunks(rows):
+            stmt = _insert_for(self.session, DocumentEntity).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["document_id", "entity_id"],
+                set_={col: stmt.excluded[col] for col in set_cols},
+            )
+            written += _written_count(self.session, stmt, DocumentEntity.__table__.c.document_id)
+        return written
 
 
 class MarketDataRepository:
@@ -197,5 +308,37 @@ class IngestionRunRepository:
         return list(
             self.session.execute(
                 select(IngestionRun).order_by(IngestionRun.started_at.desc()).limit(limit)
+            ).scalars()
+        )
+
+    def recent_successes_for(self, source_id: int, limit: int = 10) -> list[IngestionRun]:
+        """Latest successful runs for one source (freshness/volume DQ inputs)."""
+        return list(
+            self.session.execute(
+                select(IngestionRun)
+                .where(IngestionRun.source_id == source_id, IngestionRun.status == "success")
+                .order_by(IngestionRun.started_at.desc())
+                .limit(limit)
+            ).scalars()
+        )
+
+
+class DataQualityRepository:
+    """Persisted DQ assertions — every check run leaves an auditable row."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def record(self, checks: list[DataQualityCheck]) -> int:
+        """Append check rows (plain inserts — history is the point)."""
+        self.session.add_all(checks)
+        self.session.flush()
+        return len(checks)
+
+    def latest(self, limit: int = 50) -> list[DataQualityCheck]:
+        """Most recent check rows first (the `sam dq --history` query)."""
+        return list(
+            self.session.execute(
+                select(DataQualityCheck).order_by(DataQualityCheck.ran_at.desc()).limit(limit)
             ).scalars()
         )

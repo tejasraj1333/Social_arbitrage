@@ -24,10 +24,12 @@ coverage.xml
 # Models & data artifacts (tracked via registry/DVC, not git)
 models/
 data/*
-# ...except small Phase-1 recon proof samples + scorecard (committed as evidence).
+# ...except small Phase-1 recon proof samples + scorecard (committed as evidence)
+# and the Phase-3 hand-labeled resolver eval set (the >=90% precision gate).
 # Must use `data/*` (not `data/`) so this re-include is honored — git cannot
 # un-ignore a child of a fully-ignored directory.
 !data/sample/
+!data/eval/
 *.ckpt
 *.pt
 *.bin

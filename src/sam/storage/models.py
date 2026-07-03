@@ -1,9 +1,10 @@
 """ORM models.
 
-M0 shipped ``entities``; Phase 2 (ingestion backbone) adds ``sources``,
-``documents``, ``market_data`` and ``ingestion_runs`` per the target schema in
-docs/architecture.md. The rest (document_entities, sentiment_scores, sai_daily,
-...) lands in later milestones.
+M0 shipped ``entities``; Phase 2 (ingestion backbone) added ``sources``,
+``documents``, ``market_data`` and ``ingestion_runs``; Phase 3 (entity
+resolution & quality) adds ``document_entities`` and ``data_quality_checks``
+per the target schema in docs/architecture.md. The rest (sentiment_scores,
+sai_daily, ...) lands in later milestones.
 
 Point-in-time rule: every fact row carries both the event time
 (``published_at`` / ``date``) and the known time (``ingested_at``). Backtests
@@ -104,6 +105,11 @@ class Document(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     engagement: Mapped[dict[str, Any]] = mapped_column(PortableJSON, default=dict)
+    # Entity-resolution watermark: NULL = not yet scanned by the resolver.
+    # Set even when a scan finds no entities, so incremental runs skip the doc.
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
 
 class MarketData(Base):
@@ -148,3 +154,50 @@ class IngestionRun(Base):
     rows_inserted: Mapped[int] = mapped_column(Integer, default=0)
     raw_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DocumentEntity(Base):
+    """Resolved link: this document mentions this entity (Phase 3, M2 gate).
+
+    ``confidence`` reflects the strength of the match rule that produced the
+    link (cashtag > bare ticker > name/alias — see sam.processing.resolver);
+    downstream signals weight by it instead of hard-filtering. ``resolved_at``
+    is the *known* time of the link (point-in-time rule) — re-resolving with a
+    newer dictionary refreshes it.
+    """
+
+    __tablename__ = "document_entities"
+    __table_args__ = (Index("ix_document_entities_entity", "entity_id"),)
+
+    document_id: Mapped[int] = mapped_column(BigIntPK, ForeignKey("documents.id"), primary_key=True)
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entities.id"), primary_key=True)
+    confidence: Mapped[float] = mapped_column(Float)
+    method: Mapped[str] = mapped_column(String(16))  # 'cashtag' | 'ticker' | 'alias'
+    resolved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class DataQualityCheck(Base):
+    """One executed data-quality assertion (Phase 3 DQ framework).
+
+    Every check run writes a row — pass or fail — so quality is a monitored
+    time series, not a one-off script. ``value`` is the measured metric,
+    ``threshold`` what it was compared against, ``details`` the evidence
+    (e.g. offending document ids; quarantine-don't-delete).
+    """
+
+    __tablename__ = "data_quality_checks"
+    __table_args__ = (
+        CheckConstraint("status IN ('pass', 'warn', 'fail')", name="ck_dq_checks_status"),
+        Index("ix_dq_checks_name_ran", "check_name", "ran_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    check_name: Mapped[str] = mapped_column(String(64))
+    source_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(8))
+    value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    details: Mapped[dict[str, Any]] = mapped_column(PortableJSON, default=dict)
+    ran_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
