@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import feedparser
+import httpx
 
 from sam.recon.collector_base import ReconCollector
 from sam.recon.sources import load_sources
@@ -23,6 +24,26 @@ from sam.recon.sources import load_sources
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _SUMMARY_MAX = 600
+_FETCH_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+_USER_AGENT = "sam-collector/0.1"
+
+
+def _fetch_feed(url: str) -> Any:
+    """Download a feed with a hard timeout, then parse the body.
+
+    Never hand feedparser the URL: feedparser.parse(url) downloads via urllib
+    with NO timeout, so one hanging feed server stalls the whole ingest cycle
+    forever (observed live). Bytes are passed through so feedparser can do its
+    own encoding detection. Raises httpx.HTTPError on network/status failures.
+    """
+    response = httpx.get(
+        url,
+        timeout=_FETCH_TIMEOUT,
+        follow_redirects=True,
+        headers={"User-Agent": _USER_AGENT},
+    )
+    response.raise_for_status()
+    return feedparser.parse(response.content)
 
 
 def _clean_html(text: str) -> str:
@@ -63,7 +84,11 @@ class RSSCollector(ReconCollector):
         seen_urls: set[str] = set()  # dedupe articles syndicated across feeds
         for feed in self.feeds:
             name, url = feed["name"], feed["url"]
-            parsed = feedparser.parse(url)
+            try:
+                parsed = _fetch_feed(url)
+            except httpx.HTTPError as exc:
+                self.log.warning("rss_feed_error", feed=name, error=str(exc))
+                continue
             entries = parsed.get("entries", [])
             if not entries:
                 self.log.warning(

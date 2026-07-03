@@ -55,3 +55,101 @@ def test_cli_recon_error_status_exits_nonzero(monkeypatch) -> None:
 def test_cli_recon_rejects_unknown_source() -> None:
     with pytest.raises(SystemExit):  # argparse choices validation
         main(["recon", "--source", "twitter"])
+
+
+# ---------------------------------------------------------------- sam ingest
+
+
+def _ingest_result(status: str = "success"):
+    from sam.ingestion.runner import IngestResult
+
+    return IngestResult(
+        source_name="rss",
+        status=status,
+        rows_fetched=10,
+        rows_inserted=4,
+        raw_path="data/00_raw/rss/dt=2026-07-02/x.jsonl.gz",
+        run_id=1,
+        detail="" if status == "success" else "RuntimeError: boom",
+    )
+
+
+def test_cli_ingest_single_source_success(monkeypatch) -> None:
+    from sam.ingestion import runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod.IngestionRunner, "run_many", lambda self, names, backfill: [_ingest_result()]
+    )
+    assert main(["ingest", "--source", "rss"]) == 0
+
+
+def test_cli_ingest_error_exits_nonzero(monkeypatch) -> None:
+    from sam.ingestion import runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod.IngestionRunner,
+        "run_many",
+        lambda self, names, backfill: [_ingest_result("error")],
+    )
+    assert main(["ingest", "--source", "rss"]) == 1
+
+
+def test_cli_ingest_all_expands_registry(monkeypatch) -> None:
+    from sam.ingestion import runner as runner_mod
+
+    seen: dict[str, list[str]] = {}
+
+    def fake_run_many(self, names, backfill):
+        seen["names"] = list(names)
+        return [_ingest_result()]
+
+    monkeypatch.setattr(runner_mod.IngestionRunner, "run_many", fake_run_many)
+    assert main(["ingest"]) == 0
+    assert seen["names"] == ["rss", "yahoo", "hackernews"]
+
+
+def test_cli_ingest_loop_cycles_then_exits(monkeypatch) -> None:
+    from sam.cli import _run_ingest
+    from sam.ingestion import runner as runner_mod
+
+    calls = {"run": 0, "sleep": 0}
+
+    def fake_run_many(self, names, backfill):
+        calls["run"] += 1
+        return [_ingest_result()]
+
+    monkeypatch.setattr(runner_mod.IngestionRunner, "run_many", fake_run_many)
+    monkeypatch.setattr(
+        "sam.cli.time.sleep", lambda s: calls.__setitem__("sleep", calls["sleep"] + 1)
+    )
+
+    assert _run_ingest("rss", loop_seconds=1, max_cycles=3) == 0
+    assert calls["run"] == 3
+    assert calls["sleep"] == 2  # no sleep after the final cycle
+
+
+def test_cli_seed_uses_config_universe(monkeypatch, db_session) -> None:
+    from sqlalchemy import select
+
+    from sam.ingestion import runner as runner_mod
+    from sam.storage.models import Entity
+
+    monkeypatch.setattr(runner_mod, "default_session", lambda: db_session)
+    assert main(["seed"]) == 0
+    tickers = set(db_session.execute(select(Entity.ticker)).scalars())
+    assert {"AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "AMD"} == tickers
+
+
+def test_cli_runs_prints_table(monkeypatch, db_session, capsys) -> None:
+    from sam.ingestion import runner as runner_mod
+    from sam.storage.repositories import IngestionRunRepository, SourceRepository
+
+    source = SourceRepository(db_session).get_or_create("rss", "rss")
+    repo = IngestionRunRepository(db_session)
+    repo.finish(repo.start(source.id), status="success", rows_fetched=10, rows_inserted=3)
+    db_session.commit()
+
+    monkeypatch.setattr(runner_mod, "default_session", lambda: db_session)
+    assert main(["runs", "--limit", "5"]) == 0
+    out = capsys.readouterr().out
+    assert "rss" in out and "success" in out

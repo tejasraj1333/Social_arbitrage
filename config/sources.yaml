@@ -5,6 +5,7 @@
 universe:
   - { ticker: NVDA, name: "NVIDIA Corporation", sector: Technology }
   - { ticker: AAPL, name: "Apple Inc.", sector: Technology }
+  - { ticker: MSFT, name: "Microsoft Corporation", sector: Technology }
   - { ticker: TSLA, name: "Tesla, Inc.", sector: "Consumer Discretionary" }
   - { ticker: AMD,  name: "Advanced Micro Devices", sector: Technology }
   - { ticker: AMZN, name: "Amazon.com, Inc.", sector: "Consumer Discretionary" }

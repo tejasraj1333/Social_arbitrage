@@ -1,1 +1,1 @@
-"""Data collectors: reddit, rss, yahoo, kaggle (added in M1, full-ingestion)."""
+"""Ingestion backbone: collector contract, hashing, bronze lake, runner."""

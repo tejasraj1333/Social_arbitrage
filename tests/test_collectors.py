@@ -43,7 +43,7 @@ def test_rss_fetch_maps_schema_and_dedupes(monkeypatch):
         "a": [_fake_entry(0), _fake_entry(1)],
         "b": [_fake_entry(1), _fake_entry(2)],  # entry 1 duplicate by link
     }
-    monkeypatch.setattr(rc.feedparser, "parse", lambda url: {"entries": feed_entries[url]})
+    monkeypatch.setattr(rc, "_fetch_feed", lambda url: {"entries": feed_entries[url]})
 
     collector = rc.RSSCollector(feeds=feeds, target=100)
     records = collector.fetch()
@@ -60,7 +60,7 @@ def test_rss_respects_target(monkeypatch):
     from sam.collectors import rss_collector as rc
 
     entries = [_fake_entry(i) for i in range(50)]
-    monkeypatch.setattr(rc.feedparser, "parse", lambda url: {"entries": entries})
+    monkeypatch.setattr(rc, "_fetch_feed", lambda url: {"entries": entries})
     records = rc.RSSCollector(feeds=[{"name": "A", "url": "a"}], target=10).fetch()
     assert len(records) == 10
 
@@ -68,12 +68,50 @@ def test_rss_respects_target(monkeypatch):
 def test_rss_tolerates_empty_feed(monkeypatch):
     from sam.collectors import rss_collector as rc
 
-    monkeypatch.setattr(
-        rc.feedparser, "parse", lambda url: {"entries": [], "bozo_exception": "boom"}
-    )
+    monkeypatch.setattr(rc, "_fetch_feed", lambda url: {"entries": [], "bozo_exception": "boom"})
     result = rc.RSSCollector(feeds=[{"name": "Dead", "url": "x"}]).run()
     assert result.status == "empty"
     assert result.record_count == 0
+
+
+def test_rss_tolerates_network_failure_and_continues(monkeypatch):
+    import httpx
+
+    from sam.collectors import rss_collector as rc
+
+    def fake_fetch(url):
+        if url == "dead":
+            raise httpx.ConnectTimeout("hang")  # timed-out feed must be skipped
+        return {"entries": [_fake_entry(0), _fake_entry(1)]}
+
+    monkeypatch.setattr(rc, "_fetch_feed", fake_fetch)
+    feeds = [{"name": "Dead", "url": "dead"}, {"name": "Live", "url": "live"}]
+    records = rc.RSSCollector(feeds=feeds).fetch()
+    assert len(records) == 2  # the live feed still delivers
+
+
+def test_rss_feed_download_enforces_timeout(monkeypatch):
+    from sam.collectors import rss_collector as rc
+
+    captured: dict[str, object] = {}
+
+    class _FakeResponse:
+        content = b"<rss></rss>"
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+    def fake_get(url, **kwargs):
+        captured.update(kwargs, url=url)
+        return _FakeResponse()
+
+    monkeypatch.setattr(rc.httpx, "get", fake_get)
+    rc._fetch_feed("https://example.com/feed")
+    # feedparser must never fetch the URL itself (it has no timeout).
+    assert captured["url"] == "https://example.com/feed"
+    assert captured["timeout"] is rc._FETCH_TIMEOUT
+    assert captured["follow_redirects"] is True
 
 
 # ------------------------------------------------------------------------- Yahoo
