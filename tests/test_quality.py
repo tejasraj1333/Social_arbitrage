@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from sam.processing.quality import (
     DataQualityRunner,
     check_duplicate_rate,
+    check_enrichment_coverage,
     check_freshness,
     check_resolution_coverage,
     check_volume_anomaly,
@@ -25,6 +26,7 @@ from sam.storage.repositories import (
     DocumentRepository,
     EntityRepository,
     IngestionRunRepository,
+    SentimentRepository,
     SourceRepository,
 )
 
@@ -185,6 +187,39 @@ def test_resolution_coverage_counts(db_session: Session) -> None:
     assert outcome.details == {"total": 2, "unresolved": 0, "with_links": 1}
 
 
+def test_enrichment_coverage_counts_and_stall_warning(db_session: Session) -> None:
+    SourceRepository(db_session).get_or_create("rss", "rss")
+    docs = DocumentRepository(db_session)
+    docs.upsert_many([_doc("a" * 64, "Nvidia rises"), _doc("b" * 64, "Fed holds")])
+    now = datetime.now(tz=UTC)
+    docs.mark_enriched([1], at=now)
+    SentimentRepository(db_session).upsert_many(
+        [{"document_id": 1, "model": "m", "label": "positive", "score": 0.9}]
+    )
+    db_session.commit()
+
+    outcome = check_enrichment_coverage(db_session)
+    assert outcome.status == "pass"  # small corpus: backlog is expected, not a stall
+    assert outcome.value == 0.5  # 1 of 2 docs enriched
+    assert outcome.details == {"total": 2, "unenriched": 1, "with_sentiment": 1}
+
+
+def test_enrichment_coverage_warns_on_stalled_pipeline(db_session: Session) -> None:
+    SourceRepository(db_session).get_or_create("rss", "rss")
+    docs = DocumentRepository(db_session)
+    docs.upsert_many([_doc(f"{i:064x}", f"Headline {i}") for i in range(120)])
+    now = datetime.now(tz=UTC)
+    docs.mark_enriched(list(range(1, 21)), at=now)  # 20 of 120 -> >50% backlog
+    SentimentRepository(db_session).upsert_many(
+        [{"document_id": 1, "model": "m", "label": "neutral", "score": 0.5}]
+    )
+    db_session.commit()
+
+    outcome = check_enrichment_coverage(db_session)
+    assert outcome.status == "warn"
+    assert outcome.details["unenriched"] == 100
+
+
 # ------------------------------------------------------------------- runner
 
 
@@ -197,7 +232,13 @@ def test_dq_runner_persists_check_rows(db_session: Session) -> None:
 
     outcomes = DataQualityRunner(session_factory=lambda: db_session).run()
     names = {o.check_name for o in outcomes}
-    assert names == {"duplicate_rate", "freshness", "volume_anomaly", "resolution_coverage"}
+    assert names == {
+        "duplicate_rate",
+        "freshness",
+        "volume_anomaly",
+        "resolution_coverage",
+        "enrichment_coverage",
+    }
 
     rows = db_session.execute(select(DataQualityCheck)).scalars().all()
     assert len(rows) == len(outcomes)

@@ -38,6 +38,10 @@ nlp = [
     "torch>=2.3",
     "bertopic>=0.16",
     "scikit-learn>=1.5",
+    # Not imported directly: floor numba (bertopic -> umap -> pynndescent) so
+    # the resolver can't fall back to ancient llvmlite with no py3.11 wheels.
+    # Modern numba also caps numpy at a version it actually supports.
+    "numba>=0.60",
 ]
 forecasting = [
     "xgboost>=2.1",
@@ -91,6 +95,12 @@ module = [
     "praw.*",
     "feedparser.*",
     "bertopic.*",
+    "umap.*",
+    "sklearn.*",
+    # Present locally, absent in CI (nlp extra not installed there); the
+    # override only fires when the package is missing.
+    "transformers.*",
+    "sentence_transformers.*",
     "pgvector.*",
     "kaggle.*",
     "pandas.*",

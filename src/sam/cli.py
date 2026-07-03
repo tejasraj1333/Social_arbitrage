@@ -8,6 +8,8 @@ Expands per milestone. Currently exposes:
   sam ingest [--source SOURCE] [--backfill] [--loop SECONDS]
                                   run production ingestion (Phase 2)
   sam resolve [--all|--evaluate]  link documents to entities (Phase 3)
+  sam enrich [--all|--evaluate]   sentiment + embeddings for documents (Phase 4)
+  sam topics                      fit topic model over embedded documents (Phase 4)
   sam dq                          run data-quality checks (Phase 3)
   sam runs [--limit N]            show recent ingestion runs
 """
@@ -82,6 +84,21 @@ def main(argv: list[str] | None = None) -> int:
         "resolving; exits non-zero if precision drops below the 0.90 gate.",
     )
 
+    enrich = sub.add_parser("enrich", help="Score sentiment + embed documents (NLP enrichment)")
+    enrich.add_argument(
+        "--all",
+        action="store_true",
+        help="Re-enrich already-processed documents too (after changing models in config).",
+    )
+    enrich.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Score the sentiment model against the labeled sample (data/eval) instead of "
+        "enriching; exits non-zero if macro-F1 drops below the 0.70 gate.",
+    )
+
+    sub.add_parser("topics", help="Fit a topic model over embedded documents (versioned run)")
+
     sub.add_parser("dq", help="Run data-quality checks and record the results")
 
     runs = sub.add_parser("runs", help="Show recent ingestion runs (observability)")
@@ -109,6 +126,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.evaluate:
             return _run_evaluate()
         return _run_resolve(re_resolve=args.all)
+
+    if args.command == "enrich":
+        if args.evaluate:
+            return _run_enrich_evaluate()
+        return _run_enrich(re_enrich=args.all)
+
+    if args.command == "topics":
+        return _run_topics()
 
     if args.command == "dq":
         return _run_dq()
@@ -265,6 +290,100 @@ def _run_resolve(*, re_resolve: bool = False) -> int:
         matched=result.docs_matched,
         links=result.links_written,
     )
+    return 0
+
+
+def _run_enrich(*, re_enrich: bool = False) -> int:
+    """Run the NLP-enrichment pipeline over ingested documents."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sam.nlp import pipeline as nlp_pipeline_mod
+
+    logger = get_logger("sam.enrich")
+    try:
+        result = nlp_pipeline_mod.EnrichmentPipeline().run(re_enrich=re_enrich)
+    except SQLAlchemyError as exc:
+        logger.error(
+            "enrich_db_error",
+            error=str(exc),
+            hint="is Postgres up? (docker compose up -d db; SAM_DB__PORT=5433 for compose)",
+        )
+        return 1
+    except ImportError as exc:
+        logger.error(
+            "enrich_missing_deps",
+            error=str(exc),
+            hint="install the NLP extra: uv sync --extra nlp",
+        )
+        return 1
+    logger.info(
+        "enrich.complete",
+        scanned=result.docs_scanned,
+        enriched=result.docs_enriched,
+        sentiments=result.sentiments_written,
+        embeddings=result.embeddings_written,
+    )
+    return 0
+
+
+def _run_topics() -> int:
+    """Fit and persist a versioned topic-model run over embedded documents."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sam.nlp import topics as topics_mod
+
+    logger = get_logger("sam.topics")
+    try:
+        result = topics_mod.TopicPipeline().run()
+    except SQLAlchemyError as exc:
+        logger.error(
+            "topics_db_error",
+            error=str(exc),
+            hint="is Postgres up? (docker compose up -d db; SAM_DB__PORT=5433 for compose)",
+        )
+        return 1
+    except ImportError as exc:
+        logger.error(
+            "topics_missing_deps",
+            error=str(exc),
+            hint="install the NLP extra: uv sync --extra nlp",
+        )
+        return 1
+    if result.skipped:
+        logger.warning("topics.skipped", reason=result.skipped)
+        return 0  # an honest skip is not a failure (cron-safe)
+    logger.info(
+        "topics.complete",
+        version=result.version,
+        docs=result.docs_used,
+        topics=result.topics_found,
+        outliers=result.outliers,
+        assignments=result.assignments_written,
+    )
+    return 0
+
+
+def _run_enrich_evaluate() -> int:
+    """Score the sentiment model on the labeled sample; non-zero exit below the gate."""
+    from sam.nlp.evaluate import F1_GATE, evaluate_sentiment
+
+    logger = get_logger("sam.enrich.evaluate")
+    try:
+        report = evaluate_sentiment()
+    except ImportError as exc:
+        logger.error(
+            "evaluate_missing_deps",
+            error=str(exc),
+            hint="install the NLP extra: uv sync --extra nlp",
+        )
+        return 1
+    for text, expected, predicted in report.misclassified:
+        logger.warning(
+            "sentiment_misclassified", expected=expected, predicted=predicted, text=text[:120]
+        )
+    if not report.passes_gate:
+        logger.error("eval_gate_failed", macro_f1=round(report.macro_f1, 4), gate=F1_GATE)
+        return 1
     return 0
 
 

@@ -23,6 +23,10 @@ class IngestionError(SAMError):
     """A collector failed to fetch or persist data."""
 
 
+class EnrichmentError(SAMError):
+    """An NLP model produced output incompatible with the schema."""
+
+
 class NotFoundError(SAMError):
     """A requested resource (entity, signal, report) does not exist."""
 

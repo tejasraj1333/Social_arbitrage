@@ -2,9 +2,10 @@
 
 M0 shipped ``entities``; Phase 2 (ingestion backbone) added ``sources``,
 ``documents``, ``market_data`` and ``ingestion_runs``; Phase 3 (entity
-resolution & quality) adds ``document_entities`` and ``data_quality_checks``
-per the target schema in docs/architecture.md. The rest (sentiment_scores,
-sai_daily, ...) lands in later milestones.
+resolution & quality) added ``document_entities`` and ``data_quality_checks``;
+Phase 4 (NLP enrichment) adds ``sentiment_scores``, ``embeddings``, ``topics``
+and ``document_topics`` per the target schema in docs/architecture.md. The
+rest (sai_daily, forecasts, ...) lands in later milestones.
 
 Point-in-time rule: every fact row carries both the event time
 (``published_at`` / ``date``) and the known time (``ingested_at``). Backtests
@@ -20,6 +21,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     ARRAY,
     BigInteger,
@@ -41,12 +43,21 @@ from sqlalchemy.types import JSON
 
 from sam.core.db import Base
 
+# Embedding dimensionality is part of the schema (pgvector columns are fixed
+# width). all-MiniLM-L6-v2 = 384; switching to a different-width model is a
+# migration, not a config change.
+EMBEDDING_DIM = 384
+
 # JSONB on Postgres, plain JSON elsewhere (SQLite unit tests).
 PortableJSON = JSON().with_variant(JSONB(), "postgresql")
 # Postgres text[] ; JSON-encoded list on SQLite.
 PortableStringList = ARRAY(String).with_variant(JSON(), "sqlite")
 # BIGINT pk on Postgres; SQLite needs plain INTEGER for rowid autoincrement.
 BigIntPK = BigInteger().with_variant(Integer(), "sqlite")
+# pgvector on Postgres; JSON-encoded float list on SQLite. Note the read-side
+# asymmetry: Postgres returns a numpy array, SQLite a plain list — writers
+# always pass list[float], readers must not assume the concrete type.
+PortableVector = JSON().with_variant(Vector(EMBEDDING_DIM), "postgresql")
 
 
 class Entity(Base):
@@ -108,6 +119,12 @@ class Document(Base):
     # Entity-resolution watermark: NULL = not yet scanned by the resolver.
     # Set even when a scan finds no entities, so incremental runs skip the doc.
     resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    # NLP-enrichment watermark: NULL = not yet scored/embedded (Phase 4).
+    # Independent of resolved_at — resolution and enrichment are decoupled
+    # stages that may run in either order.
+    enriched_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
 
@@ -176,6 +193,82 @@ class DocumentEntity(Base):
     resolved_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class SentimentScore(Base):
+    """Document-level sentiment from a finance-domain model (Phase 4 / M3).
+
+    PK (document_id, model): one score per document per model, so a model
+    upgrade re-scores via DO UPDATE per model id while rows from other models
+    coexist for comparison. ``score`` is the model's confidence in ``label``
+    (a weight for downstream signals, not a filter). ``scored_at`` is the
+    *known* time of the score (point-in-time rule).
+    """
+
+    __tablename__ = "sentiment_scores"
+    __table_args__ = (
+        CheckConstraint("label IN ('positive', 'negative', 'neutral')", name="ck_sentiment_label"),
+    )
+
+    document_id: Mapped[int] = mapped_column(BigIntPK, ForeignKey("documents.id"), primary_key=True)
+    model: Mapped[str] = mapped_column(String(128), primary_key=True)
+    label: Mapped[str] = mapped_column(String(8))
+    score: Mapped[float] = mapped_column(Float)
+    scored_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Embedding(Base):
+    """Semantic embedding per document (pgvector column on Postgres).
+
+    PK (document_id, model) mirrors sentiment_scores. Dimension is fixed by
+    the schema (EMBEDDING_DIM); a different-width model requires a migration.
+    No ANN index yet — vector search arrives with the API phase (M8), and
+    unindexed writes keep enrichment cheap until then.
+    """
+
+    __tablename__ = "embeddings"
+
+    document_id: Mapped[int] = mapped_column(BigIntPK, ForeignKey("documents.id"), primary_key=True)
+    model: Mapped[str] = mapped_column(String(128), primary_key=True)
+    vector: Mapped[list[float]] = mapped_column(PortableVector)
+    embedded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Topic(Base):
+    """One discovered topic cluster from a versioned topic-model run (Phase 4).
+
+    Topic runs are append-only: each fit writes fresh rows under a new
+    ``topic_model_version``; "current" topics are the rows of the latest
+    version. Older versions are kept — past signal values were computed
+    against past topic models (point-in-time rule).
+    """
+
+    __tablename__ = "topics"
+    __table_args__ = (Index("ix_topics_version", "topic_model_version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    topic_model_version: Mapped[str] = mapped_column(String(64))
+    label: Mapped[str] = mapped_column(String(256))
+    keywords: Mapped[list[str]] = mapped_column(PortableStringList, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DocumentTopic(Base):
+    """Assignment of a document to a topic, with the model's probability.
+
+    Versioning rides on ``topic_id`` (topics are per-version rows), so
+    assignments from different model versions coexist without a version
+    column here.
+    """
+
+    __tablename__ = "document_topics"
+    __table_args__ = (Index("ix_document_topics_topic", "topic_id"),)
+
+    document_id: Mapped[int] = mapped_column(BigIntPK, ForeignKey("documents.id"), primary_key=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), primary_key=True)
+    probability: Mapped[float] = mapped_column(Float)
 
 
 class DataQualityCheck(Base):

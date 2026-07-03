@@ -50,7 +50,7 @@ document_entities(document_id, entity_id, confidence, method, resolved_at)
 sentiment_scores(document_id, model, label, score, scored_at)
 topics(id, topic_model_version, label, keywords[], created_at)
 document_topics(document_id, topic_id, probability)
-embeddings(document_id, vector VECTOR, model)        -- pgvector column
+embeddings(document_id, model, vector VECTOR(384), embedded_at)  -- pgvector
 sai_daily(entity_id, date, mention_growth, sentiment_momentum,
           topic_velocity, engagement_growth, sai_score, sai_rank, computed_at)
 market_data(entity_id, date, open, high, low, close, adj_close, volume)

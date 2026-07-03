@@ -8,3 +8,12 @@ db:
   port: 5432
   user: sam
   name: sam
+
+# NLP enrichment (Phase 4). Model ids are stamped on every row they produce.
+# device: "cpu" or "cuda" (SAM_NLP__DEVICE=cuda to opt in).
+nlp:
+  sentiment_model: ProsusAI/finbert
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  device: cpu
+  batch_size: 32
+  topics_min_docs: 50

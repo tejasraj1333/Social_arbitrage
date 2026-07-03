@@ -16,6 +16,9 @@ Checks:
   volume_anomaly       latest fetch size vs the source's trailing mean.
   resolution_coverage  share of resolved documents holding >=1 entity link
                        (with the unresolved backlog in details).
+  enrichment_coverage  share of documents enriched by the NLP pipeline
+                       (Phase 4; warns when a sizable corpus has zero
+                       sentiment rows — pipeline rot).
 
 Bot/spam scoring (blueprint W5) needs author-level Reddit data and joins
 this module once Reddit credentials land.
@@ -60,6 +63,10 @@ VOLUME_MIN_HISTORY = 3  # runs needed before the check is meaningful
 # Coverage is informational (most world news isn't about a 6-ticker universe),
 # but zero links across a sizable corpus means the dictionary rotted.
 COVERAGE_ROT_MIN_DOCS = 100
+
+# Unlike resolution, enrichment applies to (almost) every document — a large
+# backlog means the enrich stage stalled, which silently starves P5 signals.
+ENRICHMENT_BACKLOG_WARN = 0.5  # warn when >50% of the corpus is unenriched
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -232,6 +239,23 @@ def check_resolution_coverage(session: Session) -> CheckOutcome:
     )
 
 
+def check_enrichment_coverage(session: Session) -> CheckOutcome:
+    """Share of docs enriched; warns on a stalled pipeline or zero output."""
+    total, unenriched, with_sentiment = DocumentRepository(session).enrichment_stats()
+    enriched = total - unenriched
+    coverage = enriched / total if total else 0.0
+    backlog_ratio = unenriched / total if total else 0.0
+    rotted = enriched >= COVERAGE_ROT_MIN_DOCS and with_sentiment == 0
+    stalled = total >= COVERAGE_ROT_MIN_DOCS and backlog_ratio > ENRICHMENT_BACKLOG_WARN
+    return CheckOutcome(
+        check_name="enrichment_coverage",
+        status="warn" if (rotted or stalled) else "pass",
+        value=round(coverage, 4),
+        threshold=None,
+        details={"total": total, "unenriched": unenriched, "with_sentiment": with_sentiment},
+    )
+
+
 class DataQualityRunner:
     """Run all checks, persist their rows, and report the outcomes."""
 
@@ -246,6 +270,7 @@ class DataQualityRunner:
             outcomes.extend(check_freshness(session))
             outcomes.extend(check_volume_anomaly(session))
             outcomes.append(check_resolution_coverage(session))
+            outcomes.append(check_enrichment_coverage(session))
 
             DataQualityRepository(session).record([o.to_row() for o in outcomes])
             session.commit()

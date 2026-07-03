@@ -25,10 +25,14 @@ from sam.storage.models import (
     DataQualityCheck,
     Document,
     DocumentEntity,
+    DocumentTopic,
+    Embedding,
     Entity,
     IngestionRun,
     MarketData,
+    SentimentScore,
     Source,
+    Topic,
 )
 
 log = get_logger("storage.repositories")
@@ -189,6 +193,39 @@ class DocumentRepository:
             update(Document).where(Document.id.in_(document_ids)).values(resolved_at=at)
         )
 
+    def enrichment_batch(
+        self, *, after_id: int = 0, limit: int = 500, include_enriched: bool = False
+    ) -> list[Document]:
+        """Next id-ordered batch for the NLP enricher (keyset pagination).
+
+        Mirror of :meth:`resolution_batch` on the ``enriched_at`` watermark;
+        ``include_enriched=True`` is the ``sam enrich --all`` path after a
+        model change.
+        """
+        stmt = select(Document).where(Document.id > after_id).order_by(Document.id).limit(limit)
+        if not include_enriched:
+            stmt = stmt.where(Document.enriched_at.is_(None))
+        return list(self.session.execute(stmt).scalars())
+
+    def mark_enriched(self, document_ids: list[int], *, at: datetime) -> None:
+        """Stamp the enrichment watermark — also for docs with no usable text."""
+        if not document_ids:
+            return
+        self.session.execute(
+            update(Document).where(Document.id.in_(document_ids)).values(enriched_at=at)
+        )
+
+    def enrichment_stats(self) -> tuple[int, int, int]:
+        """(total, unenriched, with_sentiment) document counts for DQ coverage."""
+        total = self.session.execute(select(func.count(Document.id))).scalar_one()
+        unenriched = self.session.execute(
+            select(func.count(Document.id)).where(Document.enriched_at.is_(None))
+        ).scalar_one()
+        with_sentiment = self.session.execute(
+            select(func.count(func.distinct(SentimentScore.document_id)))
+        ).scalar_one()
+        return total, unenriched, with_sentiment
+
     def recent_titles(self, limit: int = 1000) -> list[tuple[int, str | None]]:
         """(id, title) of the most recent documents — the near-dup check window.
 
@@ -242,6 +279,143 @@ class DocumentEntityRepository:
             )
             written += _written_count(self.session, stmt, DocumentEntity.__table__.c.document_id)
         return written
+
+
+class SentimentRepository:
+    """sentiment_scores — the enricher's sentiment output table."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_many(self, scores: list[dict[str, Any]]) -> int:
+        """Upsert scores on (document_id, model); the latest scoring wins.
+
+        DO UPDATE (not DO NOTHING): re-enriching after ``--all`` must refresh
+        label/score/scored_at. Rows from *different* models coexist — the
+        model id is part of the key.
+        """
+        deduped: dict[tuple[int, str], dict[str, Any]] = {
+            (row["document_id"], row["model"]): row for row in scores
+        }
+        rows = list(deduped.values())
+        if not rows:
+            return 0
+
+        set_cols = ["label", "score", "scored_at"]
+        written = 0
+        for chunk in _chunks(rows):
+            stmt = _insert_for(self.session, SentimentScore).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["document_id", "model"],
+                set_={col: stmt.excluded[col] for col in set_cols},
+            )
+            written += _written_count(self.session, stmt, SentimentScore.__table__.c.document_id)
+        return written
+
+
+class EmbeddingRepository:
+    """embeddings — the enricher's vector output table (pgvector on Postgres)."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_many(self, embeddings: list[dict[str, Any]]) -> int:
+        """Upsert vectors on (document_id, model); the latest embedding wins."""
+        deduped: dict[tuple[int, str], dict[str, Any]] = {
+            (row["document_id"], row["model"]): row for row in embeddings
+        }
+        rows = list(deduped.values())
+        if not rows:
+            return 0
+
+        set_cols = ["vector", "embedded_at"]
+        written = 0
+        for chunk in _chunks(rows):
+            stmt = _insert_for(self.session, Embedding).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["document_id", "model"],
+                set_={col: stmt.excluded[col] for col in set_cols},
+            )
+            written += _written_count(self.session, stmt, Embedding.__table__.c.document_id)
+        return written
+
+    def rows_with_documents(self, model: str) -> list[tuple[int, str | None, str | None, Any]]:
+        """(document_id, title, raw_text, vector) for every doc embedded by ``model``.
+
+        The topic pipeline's input: precomputed vectors joined to their text.
+        ``vector`` is dialect-typed (ndarray on Postgres, list on SQLite) —
+        callers must not assume the concrete type.
+        """
+        rows = self.session.execute(
+            select(Document.id, Document.title, Document.raw_text, Embedding.vector)
+            .join(Embedding, Embedding.document_id == Document.id)
+            .where(Embedding.model == model)
+            .order_by(Document.id)
+        ).tuples()
+        return list(rows)
+
+
+class TopicRepository:
+    """topics + document_topics — versioned output of topic-model runs."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create_topics(self, version: str, topics: list[dict[str, Any]]) -> list[Topic]:
+        """Insert this run's topic rows (append-only; versions coexist)."""
+        rows = [
+            Topic(
+                topic_model_version=version,
+                label=item["label"],
+                keywords=list(item.get("keywords", [])),
+            )
+            for item in topics
+        ]
+        self.session.add_all(rows)
+        self.session.flush()  # assign ids for the assignment step
+        return rows
+
+    def assign_documents(self, assignments: list[dict[str, Any]]) -> int:
+        """Upsert document→topic assignments on (document_id, topic_id).
+
+        DO UPDATE on probability so re-running the same version is idempotent;
+        assignments from older versions survive untouched (their topic ids
+        belong to older topic rows).
+        """
+        deduped: dict[tuple[int, int], dict[str, Any]] = {
+            (row["document_id"], row["topic_id"]): row for row in assignments
+        }
+        rows = list(deduped.values())
+        if not rows:
+            return 0
+
+        written = 0
+        for chunk in _chunks(rows):
+            stmt = _insert_for(self.session, DocumentTopic).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["document_id", "topic_id"],
+                set_={"probability": stmt.excluded["probability"]},
+            )
+            written += _written_count(self.session, stmt, DocumentTopic.__table__.c.document_id)
+        return written
+
+    def latest_version(self) -> str | None:
+        """Most recent topic_model_version (by creation time), if any."""
+        return (
+            self.session.execute(
+                select(Topic.topic_model_version).order_by(Topic.created_at.desc(), Topic.id.desc())
+            )
+            .scalars()
+            .first()
+        )
+
+    def topics_for_version(self, version: str) -> list[Topic]:
+        """Topic rows of one run, id-ordered."""
+        return list(
+            self.session.execute(
+                select(Topic).where(Topic.topic_model_version == version).order_by(Topic.id)
+            ).scalars()
+        )
 
 
 class MarketDataRepository:

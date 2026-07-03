@@ -7,13 +7,23 @@ from datetime import UTC, date, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sam.storage.models import Document, Entity, MarketData, Source
+from sam.storage.models import (
+    Document,
+    DocumentTopic,
+    Entity,
+    MarketData,
+    SentimentScore,
+    Source,
+)
 from sam.storage.repositories import (
     DocumentRepository,
+    EmbeddingRepository,
     EntityRepository,
     IngestionRunRepository,
     MarketDataRepository,
+    SentimentRepository,
     SourceRepository,
+    TopicRepository,
 )
 
 UNIVERSE = [
@@ -176,3 +186,102 @@ def test_ingestion_run_start_finish_and_recent(db_session: Session) -> None:
     recent = repo.recent(limit=10)
     assert len(recent) == 2
     assert {r.status for r in recent} == {"success", "error"}
+
+
+def _seed_docs(session: Session, n: int = 3) -> list[int]:
+    """Insert n documents (via the repo, like production) and return their ids."""
+    SourceRepository(session).get_or_create("rss", "rss")
+    docs = [_doc(f"{i:064x}", title=f"Headline number {i}") for i in range(n)]
+    DocumentRepository(session).upsert_many(docs)
+    return list(session.execute(select(Document.id).order_by(Document.id)).scalars())
+
+
+def test_sentiment_upsert_refreshes_and_models_coexist(db_session: Session) -> None:
+    (doc_id,) = _seed_docs(db_session, n=1)
+    repo = SentimentRepository(db_session)
+
+    row = {"document_id": doc_id, "model": "finbert-v1", "label": "neutral", "score": 0.6}
+    assert repo.upsert_many([row]) == 1
+    # Re-scoring the same (doc, model) refreshes in place (DO UPDATE).
+    assert repo.upsert_many([dict(row, label="positive", score=0.9)]) == 1
+    stored = db_session.execute(select(SentimentScore)).scalar_one()
+    assert (stored.label, stored.score) == ("positive", 0.9)
+
+    # A different model id is a new row, not a conflict.
+    assert repo.upsert_many([dict(row, model="finbert-v2")]) == 1
+    assert len(db_session.execute(select(SentimentScore)).scalars().all()) == 2
+
+    # Intra-batch duplicates collapse last-wins; empty batch is a no-op.
+    assert repo.upsert_many([row, dict(row, label="negative")]) == 1
+    assert repo.upsert_many([]) == 0
+
+
+def test_embedding_upsert_and_document_join(db_session: Session) -> None:
+    ids = _seed_docs(db_session, n=2)
+    repo = EmbeddingRepository(db_session)
+
+    rows = [
+        {"document_id": ids[0], "model": "minilm", "vector": [0.1, 0.2]},
+        {"document_id": ids[1], "model": "minilm", "vector": [0.3, 0.4]},
+        {"document_id": ids[0], "model": "other-model", "vector": [9.9]},
+    ]
+    assert repo.upsert_many(rows) == 3
+    # Refresh wins (DO UPDATE on vector).
+    assert repo.upsert_many([dict(rows[0], vector=[0.5, 0.6])]) == 1
+
+    joined = repo.rows_with_documents("minilm")
+    assert [(doc_id, list(vec)) for doc_id, _t, _r, vec in joined] == [
+        (ids[0], [0.5, 0.6]),
+        (ids[1], [0.3, 0.4]),
+    ]
+    assert joined[0][1] == "Headline number 0"  # title comes along for topic fitting
+
+
+def test_enrichment_batch_watermark_and_pagination(db_session: Session) -> None:
+    ids = _seed_docs(db_session, n=3)
+    repo = DocumentRepository(db_session)
+
+    assert [d.id for d in repo.enrichment_batch()] == ids
+    repo.mark_enriched(ids[:2], at=datetime(2026, 7, 3, tzinfo=UTC))
+    assert [d.id for d in repo.enrichment_batch()] == ids[2:]  # watermark skips done
+    assert [d.id for d in repo.enrichment_batch(include_enriched=True)] == ids  # --all
+    assert [d.id for d in repo.enrichment_batch(after_id=ids[2])] == []  # keyset
+    repo.mark_enriched([], at=datetime(2026, 7, 3, tzinfo=UTC))  # no-op, no error
+
+
+def test_enrichment_stats_counts(db_session: Session) -> None:
+    ids = _seed_docs(db_session, n=3)
+    repo = DocumentRepository(db_session)
+    repo.mark_enriched(ids[:2], at=datetime(2026, 7, 3, tzinfo=UTC))
+    SentimentRepository(db_session).upsert_many(
+        [{"document_id": ids[0], "model": "m", "label": "neutral", "score": 0.5}]
+    )
+    assert repo.enrichment_stats() == (3, 1, 1)  # total, unenriched, with_sentiment
+
+
+def test_topic_create_assign_and_versioning(db_session: Session) -> None:
+    ids = _seed_docs(db_session, n=2)
+    repo = TopicRepository(db_session)
+
+    v1 = repo.create_topics(
+        "v1", [{"label": "ai_chips", "keywords": ["nvidia", "gpu"]}, {"label": "macro"}]
+    )
+    assert [t.id is not None for t in v1] == [True, True]
+    assert repo.latest_version() == "v1"
+
+    assignments = [
+        {"document_id": ids[0], "topic_id": v1[0].id, "probability": 0.8},
+        {"document_id": ids[1], "topic_id": v1[1].id, "probability": 0.7},
+    ]
+    assert repo.assign_documents(assignments) == 2
+    # Re-running the same version refreshes probabilities idempotently.
+    assert repo.assign_documents([dict(assignments[0], probability=0.9)]) == 1
+    stored = {
+        dt.document_id: dt.probability for dt in db_session.execute(select(DocumentTopic)).scalars()
+    }
+    assert stored == {ids[0]: 0.9, ids[1]: 0.7}
+    assert repo.assign_documents([]) == 0
+
+    repo.create_topics("v2", [{"label": "ai_chips_v2", "keywords": ["nvidia"]}])
+    assert repo.latest_version() == "v2"
+    assert [t.label for t in repo.topics_for_version("v1")] == ["ai_chips", "macro"]

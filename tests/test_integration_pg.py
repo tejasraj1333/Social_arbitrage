@@ -24,14 +24,25 @@ from sqlalchemy.orm import Session, sessionmaker
 from sam.core.db import Base
 from sam.processing.pipeline import ResolutionPipeline
 from sam.processing.quality import DataQualityRunner
-from sam.storage.models import DataQualityCheck, Document, DocumentEntity, MarketData
+from sam.storage.models import (
+    EMBEDDING_DIM,
+    DataQualityCheck,
+    Document,
+    DocumentEntity,
+    Embedding,
+    MarketData,
+    SentimentScore,
+)
 from sam.storage.repositories import (
     DocumentEntityRepository,
     DocumentRepository,
+    EmbeddingRepository,
     EntityRepository,
     IngestionRunRepository,
     MarketDataRepository,
+    SentimentRepository,
     SourceRepository,
+    TopicRepository,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -50,8 +61,13 @@ def pg_engine() -> Iterator[object]:
         conn.execute(text(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {_SCHEMA}"))
         conn.commit()
-    engine = create_engine(url, connect_args={"options": f"-csearch_path={_SCHEMA}"})
-    Base.metadata.create_all(engine)
+    # public stays on the search path so the pgvector *type* (installed in
+    # public) resolves; tables are created in the first schema (sam_test).
+    engine = create_engine(url, connect_args={"options": f"-csearch_path={_SCHEMA},public"})
+    # checkfirst=False: with public visible, the existence check would find
+    # the *production* tables and skip creation; sam_test was just recreated
+    # empty, so unconditional CREATE TABLE is both safe and required.
+    Base.metadata.create_all(engine, checkfirst=False)
     yield engine
     engine.dispose()
     with admin.connect() as conn:
@@ -66,9 +82,14 @@ def pg_session(pg_engine) -> Iterator[Session]:
     with factory() as session:
         yield session
         session.rollback()
-        # Clean tables between tests (order respects FKs).
+        # Clean tables between tests (order respects FKs). Schema-qualified so
+        # the search_path can never resolve these names to real public tables.
         for table in (
             "data_quality_checks",
+            "document_topics",
+            "topics",
+            "embeddings",
+            "sentiment_scores",
             "document_entities",
             "ingestion_runs",
             "documents",
@@ -76,7 +97,7 @@ def pg_session(pg_engine) -> Iterator[Session]:
             "sources",
             "entities",
         ):
-            session.execute(text(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE"))
+            session.execute(text(f"TRUNCATE TABLE {_SCHEMA}.{table} RESTART IDENTITY CASCADE"))
         session.commit()
 
 
@@ -220,7 +241,66 @@ def test_dq_runner_persists_on_postgres(pg_session: Session) -> None:
         "freshness",
         "volume_anomaly",
         "resolution_coverage",
+        "enrichment_coverage",
     }
     rows = pg_session.execute(select(DataQualityCheck)).scalars().all()
     assert len(rows) == len(outcomes)
     assert all(isinstance(row.details, dict) for row in rows)  # JSONB round-trip
+
+
+def test_embedding_vector_round_trip_on_postgres(pg_session: Session) -> None:
+    """Real pgvector semantics: list[float] in, numpy array out, DO UPDATE wins."""
+    source = SourceRepository(pg_session).get_or_create("rss", "rss")
+    DocumentRepository(pg_session).upsert_many([_pg_doc(source.id, "e" * 64, "Nvidia rises")])
+    doc_id = pg_session.execute(select(Document.id)).scalar_one()
+
+    repo = EmbeddingRepository(pg_session)
+    vector = [float(i) / EMBEDDING_DIM for i in range(EMBEDDING_DIM)]
+    assert repo.upsert_many([{"document_id": doc_id, "model": "minilm", "vector": vector}]) == 1
+    refreshed = [v + 1.0 for v in vector]
+    assert repo.upsert_many([{"document_id": doc_id, "model": "minilm", "vector": refreshed}]) == 1
+    pg_session.commit()
+
+    stored = pg_session.execute(select(Embedding)).scalar_one()
+    values = [float(x) for x in stored.vector]  # pgvector returns a numpy array
+    assert len(values) == EMBEDDING_DIM
+    assert values[0] == 1.0 and abs(values[-1] - (1.0 + (EMBEDDING_DIM - 1) / EMBEDDING_DIM)) < 1e-6
+
+    joined = repo.rows_with_documents("minilm")
+    assert [(row[0], row[1]) for row in joined] == [(doc_id, "Nvidia rises")]
+
+
+def test_sentiment_upsert_do_update_on_postgres(pg_session: Session) -> None:
+    source = SourceRepository(pg_session).get_or_create("rss", "rss")
+    DocumentRepository(pg_session).upsert_many([_pg_doc(source.id, "f" * 64, "Apple slides")])
+    doc_id = pg_session.execute(select(Document.id)).scalar_one()
+
+    repo = SentimentRepository(pg_session)
+    row = {"document_id": doc_id, "model": "finbert", "label": "neutral", "score": 0.5}
+    assert repo.upsert_many([row]) == 1
+    assert repo.upsert_many([dict(row, label="negative", score=0.95)]) == 1  # DO UPDATE
+    pg_session.commit()
+
+    stored = pg_session.execute(select(SentimentScore)).scalar_one()
+    assert (stored.label, stored.score) == ("negative", 0.95)
+    assert stored.scored_at.tzinfo is not None  # timestamptz round-trip
+
+
+def test_topic_versioning_on_postgres(pg_session: Session) -> None:
+    source = SourceRepository(pg_session).get_or_create("rss", "rss")
+    DocumentRepository(pg_session).upsert_many([_pg_doc(source.id, "9" * 64, "Chips rally")])
+    doc_id = pg_session.execute(select(Document.id)).scalar_one()
+
+    repo = TopicRepository(pg_session)
+    topics = repo.create_topics("v1", [{"label": "chips", "keywords": ["gpu", "fab"]}])
+    assert (
+        repo.assign_documents(
+            [{"document_id": doc_id, "topic_id": topics[0].id, "probability": 0.7}]
+        )
+        == 1
+    )
+    pg_session.commit()
+
+    assert repo.latest_version() == "v1"
+    (loaded,) = repo.topics_for_version("v1")
+    assert loaded.keywords == ["gpu", "fab"]  # text[] round-trip

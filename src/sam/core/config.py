@@ -60,6 +60,22 @@ class LLMSettings(BaseModel):
     report_model: str = "claude-opus-4-8"
 
 
+class NLPSettings(BaseModel):
+    """NLP enrichment models (Phase 4). Model ids are recorded on every row
+    they produce, so changing one here starts writing under the new id rather
+    than silently mixing outputs. The embedding model's width must match the
+    schema (see sam.storage.models.EMBEDDING_DIM)."""
+
+    sentiment_model: str = "ProsusAI/finbert"
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # "cpu" (default) or "cuda". Both configured models fit small GPUs.
+    device: str = "cpu"
+    batch_size: int = 32
+    # Below this many enriched documents a topic fit is skipped (UMAP/HDBSCAN
+    # degenerate on tiny corpora); mirrors DQ's "insufficient history" honesty.
+    topics_min_docs: int = 50
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SAM_",
@@ -79,6 +95,7 @@ class Settings(BaseSettings):
     reddit: RedditSettings = Field(default_factory=RedditSettings)
     kaggle: KaggleSettings = Field(default_factory=KaggleSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
+    nlp: NLPSettings = Field(default_factory=NLPSettings)
 
     @classmethod
     def settings_customise_sources(
