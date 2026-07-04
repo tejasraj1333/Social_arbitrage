@@ -10,6 +10,7 @@ Expands per milestone. Currently exposes:
   sam resolve [--all|--evaluate]  link documents to entities (Phase 3)
   sam enrich [--all|--evaluate]   sentiment + embeddings for documents (Phase 4)
   sam topics                      fit topic model over embedded documents (Phase 4)
+  sam sai [--rebuild]             compute the daily SAI panel (Phase 5)
   sam dq                          run data-quality checks (Phase 3)
   sam runs [--limit N]            show recent ingestion runs
 """
@@ -99,6 +100,14 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("topics", help="Fit a topic model over embedded documents (versioned run)")
 
+    sai = sub.add_parser("sai", help="Compute the daily Social Arbitrage Index panel")
+    sai.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Recompute every closed day from raw (after changing signal settings "
+        "or the sentiment model); must reproduce identical values.",
+    )
+
     sub.add_parser("dq", help="Run data-quality checks and record the results")
 
     runs = sub.add_parser("runs", help="Show recent ingestion runs (observability)")
@@ -134,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "topics":
         return _run_topics()
+
+    if args.command == "sai":
+        return _run_sai(rebuild=args.rebuild)
 
     if args.command == "dq":
         return _run_dq()
@@ -359,6 +371,35 @@ def _run_topics() -> int:
         topics=result.topics_found,
         outliers=result.outliers,
         assignments=result.assignments_written,
+    )
+    return 0
+
+
+def _run_sai(*, rebuild: bool = False) -> int:
+    """Compute (or rebuild) the daily SAI panel over closed UTC days."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sam.signals import pipeline as sai_pipeline_mod
+
+    logger = get_logger("sam.sai")
+    try:
+        result = sai_pipeline_mod.SaiPipeline().run(rebuild=rebuild)
+    except SQLAlchemyError as exc:
+        logger.error(
+            "sai_db_error",
+            error=str(exc),
+            hint="is Postgres up? (docker compose up -d db; SAM_DB__PORT=5433 for compose)",
+        )
+        return 1
+    if result.skipped:
+        logger.warning("sai.skipped", reason=result.skipped)
+        return 0  # an honest skip is not a failure (cron-safe)
+    logger.info(
+        "sai.complete",
+        days=result.days_computed,
+        rows=result.rows_written,
+        first_day=str(result.first_day),
+        last_day=str(result.last_day),
     )
     return 0
 

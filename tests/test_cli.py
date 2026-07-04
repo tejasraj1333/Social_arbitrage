@@ -202,6 +202,18 @@ def test_cli_resolve_evaluate_passes_gate() -> None:
     assert main(["resolve", "--evaluate"]) == 0
 
 
+def test_cli_sai_skips_honestly_on_empty_db(monkeypatch, db_session) -> None:
+    # No linked documents -> honest skip, exit 0 (cron-safe), nothing written.
+    from sqlalchemy import select
+
+    from sam.signals import pipeline as sai_pipeline_mod
+    from sam.storage.models import SaiDaily
+
+    monkeypatch.setattr(sai_pipeline_mod, "default_session", lambda: db_session)
+    assert main(["sai"]) == 0
+    assert db_session.execute(select(SaiDaily)).scalars().all() == []
+
+
 def test_cli_dq_prints_table_and_persists(monkeypatch, db_session, capsys) -> None:
     from sqlalchemy import select
 

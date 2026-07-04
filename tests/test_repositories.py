@@ -14,14 +14,18 @@ from sam.storage.models import (
     MarketData,
     SentimentScore,
     Source,
+    Topic,
 )
 from sam.storage.repositories import (
+    DocumentEntityRepository,
     DocumentRepository,
     EmbeddingRepository,
     EntityRepository,
     IngestionRunRepository,
     MarketDataRepository,
+    SaiRepository,
     SentimentRepository,
+    SignalInputRepository,
     SourceRepository,
     TopicRepository,
 )
@@ -285,3 +289,142 @@ def test_topic_create_assign_and_versioning(db_session: Session) -> None:
     repo.create_topics("v2", [{"label": "ai_chips_v2", "keywords": ["nvidia"]}])
     assert repo.latest_version() == "v2"
     assert [t.label for t in repo.topics_for_version("v1")] == ["ai_chips", "macro"]
+
+
+def test_topic_versions_returns_oldest_first_with_created_at(db_session: Session) -> None:
+    _seed_docs(db_session, n=1)
+    # Explicit created_at: SQLite's CURRENT_TIMESTAMP has second precision,
+    # so two runs in one test would otherwise tie.
+    db_session.add_all(
+        [
+            Topic(topic_model_version="v2", label="b", created_at=datetime(2026, 7, 3, 12)),
+            Topic(topic_model_version="v1", label="a", created_at=datetime(2026, 7, 1, 12)),
+            Topic(topic_model_version="v1", label="a2", created_at=datetime(2026, 7, 1, 12)),
+        ]
+    )
+    db_session.flush()
+    versions = TopicRepository(db_session).versions()
+    assert [v for v, _ in versions] == ["v1", "v2"]
+    assert versions[0][1] == datetime(2026, 7, 1, 12)
+
+
+def test_sai_upsert_refreshes_and_watermark(db_session: Session) -> None:
+    EntityRepository(db_session).seed(UNIVERSE)
+    ids = EntityRepository(db_session).by_ticker()
+    repo = SaiRepository(db_session)
+    assert repo.latest_date() is None  # empty panel -> no watermark
+
+    rows = [
+        {
+            "entity_id": ids["AAPL"],
+            "date": date(2026, 7, 2),
+            "mention_growth": 0.5,
+            "sentiment_momentum": None,
+            "topic_velocity": None,
+            "engagement_growth": 0.1,
+            "sai_score": 0.3,
+            "sai_rank": 1,
+            "computed_at": datetime(2026, 7, 3, tzinfo=UTC),
+        },
+        {
+            "entity_id": ids["MSFT"],
+            "date": date(2026, 7, 2),
+            "mention_growth": -0.2,
+            "sentiment_momentum": None,
+            "topic_velocity": None,
+            "engagement_growth": None,
+            "sai_score": -0.3,
+            "sai_rank": 2,
+            "computed_at": datetime(2026, 7, 3, tzinfo=UTC),
+        },
+    ]
+    assert repo.upsert_many(rows) == 2
+    # Rebuild wins (DO UPDATE on every signal column).
+    assert repo.upsert_many([dict(rows[0], sai_score=0.9, sai_rank=1)]) == 1
+    stored = repo.rows_ordered()
+    assert [(r.entity_id, r.sai_score) for r in stored] == [
+        (ids["AAPL"], 0.9),
+        (ids["MSFT"], -0.3),
+    ]
+    assert repo.latest_date() == date(2026, 7, 2)
+    assert repo.upsert_many([]) == 0
+
+
+def test_signal_input_linked_document_rows_pins_model_and_signs_sentiment(
+    db_session: Session,
+) -> None:
+    EntityRepository(db_session).seed(UNIVERSE)
+    ids = EntityRepository(db_session).by_ticker()
+    doc_ids = _seed_docs(db_session, n=4)
+    linked, unenriched, negative, _unlinked = doc_ids
+
+    now = datetime(2026, 7, 2, tzinfo=UTC)
+    DocumentEntityRepository(db_session).upsert_many(
+        [
+            {
+                "document_id": linked,
+                "entity_id": ids["AAPL"],
+                "confidence": 0.9,
+                "method": "ticker",
+                "resolved_at": now,
+            },
+            {
+                "document_id": unenriched,
+                "entity_id": ids["AAPL"],
+                "confidence": 0.6,
+                "method": "alias",
+                "resolved_at": now,
+            },
+            {
+                "document_id": negative,
+                "entity_id": ids["MSFT"],
+                "confidence": 1.0,
+                "method": "cashtag",
+                "resolved_at": now,
+            },
+        ]
+    )
+    SentimentRepository(db_session).upsert_many(
+        [
+            {"document_id": linked, "model": "finbert", "label": "positive", "score": 0.8},
+            {"document_id": linked, "model": "other-model", "label": "negative", "score": 0.9},
+            {"document_id": negative, "model": "finbert", "label": "negative", "score": 0.7},
+        ]
+    )
+    db_session.flush()
+
+    rows = SignalInputRepository(db_session).linked_document_rows("finbert")
+    by_doc = {(doc_id, entity_id): row for doc_id, entity_id, *row in rows}
+    assert set(by_doc) == {
+        (linked, ids["AAPL"]),
+        (unenriched, ids["AAPL"]),
+        (negative, ids["MSFT"]),
+    }
+    assert by_doc[(linked, ids["AAPL"])][-1] == 0.8  # positive -> +score; other-model ignored
+    assert by_doc[(negative, ids["MSFT"])][-1] == -0.7  # negative -> -score
+    assert by_doc[(unenriched, ids["AAPL"])][-1] is None  # not scored by this model
+    assert by_doc[(linked, ids["AAPL"])][0] == 0.9  # confidence rides along
+    assert by_doc[(linked, ids["AAPL"])][3] == {"score": 1}  # engagement snapshot
+
+
+def test_signal_input_topic_assignment_rows_carry_versions(db_session: Session) -> None:
+    doc_ids = _seed_docs(db_session, n=2)
+    topics = TopicRepository(db_session)
+    (v1_topic,) = topics.create_topics("v1", [{"label": "ai"}])
+    (v2_topic,) = topics.create_topics("v2", [{"label": "ai_refit"}])
+    topics.assign_documents(
+        [
+            {"document_id": doc_ids[0], "topic_id": v1_topic.id, "probability": 0.8},
+            {"document_id": doc_ids[0], "topic_id": v2_topic.id, "probability": 0.9},
+            {"document_id": doc_ids[1], "topic_id": v2_topic.id, "probability": 0.4},
+        ]
+    )
+    db_session.flush()
+
+    rows = SignalInputRepository(db_session).topic_assignment_rows()
+    slim = [(doc_id, topic_id, version, prob) for doc_id, _i, _p, topic_id, version, prob in rows]
+    assert slim == [
+        (doc_ids[0], v1_topic.id, "v1", 0.8),
+        (doc_ids[0], v2_topic.id, "v2", 0.9),
+        (doc_ids[1], v2_topic.id, "v2", 0.4),
+    ]

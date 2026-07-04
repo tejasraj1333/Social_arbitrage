@@ -17,6 +17,7 @@ from sam.processing.quality import (
     check_enrichment_coverage,
     check_freshness,
     check_resolution_coverage,
+    check_sai_freshness,
     check_volume_anomaly,
     near_duplicate_pairs,
 )
@@ -26,6 +27,7 @@ from sam.storage.repositories import (
     DocumentRepository,
     EntityRepository,
     IngestionRunRepository,
+    SaiRepository,
     SentimentRepository,
     SourceRepository,
 )
@@ -220,6 +222,54 @@ def test_enrichment_coverage_warns_on_stalled_pipeline(db_session: Session) -> N
     assert outcome.details["unenriched"] == 100
 
 
+def test_sai_freshness_lag_statuses(db_session: Session) -> None:
+    SourceRepository(db_session).get_or_create("rss", "rss")
+    EntityRepository(db_session).seed([{"ticker": "NVDA", "name": "NVIDIA Corporation"}])
+    repo = SaiRepository(db_session)
+    now = datetime(2026, 7, 10, 9, tzinfo=UTC)  # "yesterday" = 7/09
+
+    repo.upsert_many([{"entity_id": 1, "date": datetime(2026, 7, 9).date()}])
+    fresh = check_sai_freshness(db_session, now=now)
+    assert (fresh.status, fresh.value) == ("pass", 0.0)
+
+    # Five days later the same panel is 4 closed days behind: the chain broke.
+    stale = check_sai_freshness(db_session, now=datetime(2026, 7, 14, 9, tzinfo=UTC))
+    assert stale.status == "warn"
+    assert stale.value == 4.0
+    assert stale.details["latest_day"] == "2026-07-09"
+
+
+def test_sai_freshness_missing_panel_warns_only_on_sizable_corpus(db_session: Session) -> None:
+    SourceRepository(db_session).get_or_create("rss", "rss")
+    EntityRepository(db_session).seed([{"ticker": "NVDA", "name": "NVIDIA Corporation"}])
+
+    # Young corpus, no panel: honest pass with the reason recorded.
+    young = check_sai_freshness(db_session)
+    assert young.status == "pass"
+    assert young.details["reason"] == "no sai_daily rows"
+
+    # 120 linked documents and still no panel: the sai stage rotted -> warn.
+    docs = DocumentRepository(db_session)
+    docs.upsert_many([_doc(f"{i:064x}", f"Headline {i}") for i in range(120)])
+    now = datetime.now(tz=UTC)
+    DocumentEntityRepository(db_session).upsert_many(
+        [
+            {
+                "document_id": i,
+                "entity_id": 1,
+                "confidence": 0.9,
+                "method": "ticker",
+                "resolved_at": now,
+            }
+            for i in range(1, 121)
+        ]
+    )
+    db_session.commit()
+    rotted = check_sai_freshness(db_session)
+    assert rotted.status == "warn"
+    assert rotted.details["linked_documents"] == 120
+
+
 # ------------------------------------------------------------------- runner
 
 
@@ -238,6 +288,7 @@ def test_dq_runner_persists_check_rows(db_session: Session) -> None:
         "volume_anomaly",
         "resolution_coverage",
         "enrichment_coverage",
+        "sai_freshness",
     }
 
     rows = db_session.execute(select(DataQualityCheck)).scalars().all()

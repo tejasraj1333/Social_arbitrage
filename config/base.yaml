@@ -17,3 +17,14 @@ nlp:
   device: cpu
   batch_size: 32
   topics_min_docs: 50
+
+# SAI computation (Phase 5). Any change here alters signal values — run
+# `sam sai --rebuild` afterwards (see docs/sai_methodology.md).
+signals:
+  window_days: 7
+  min_history_days: 3
+  max_doc_age_days: 7
+  weight_mentions: 0.25
+  weight_sentiment: 0.25
+  weight_topics: 0.25
+  weight_engagement: 0.25

@@ -47,8 +47,9 @@ rss:
     - { name: "Nasdaq Markets",  url: "https://www.nasdaq.com/feed/rssoutbound?category=Markets" }
 
 yahoo:
-  # Phase-1 recon universe (per Phase 1 spec); period/interval for OHLCV.
-  universe: [AAPL, MSFT, NVDA, TSLA, AMZN]
+  # Market-label universe; must cover every entity in `universe` above so the
+  # SAI panel joins to a complete market panel (AMD added in Phase 5).
+  universe: [AAPL, MSFT, NVDA, TSLA, AMZN, AMD]
   period: "1y"
   interval: "1d"
 

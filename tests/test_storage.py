@@ -1,8 +1,8 @@
-"""Schema round-trip tests for the Phase-2/3/4 tables (in-memory SQLite).
+"""Schema round-trip tests for the Phase-2/3/4/5 tables (in-memory SQLite).
 
 The models declare portable column types, so the same ORM definitions run on
 SQLite here and on Postgres in production (DDL canonicalized by migrations
-0002-0004).
+0002-0005).
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from sam.storage.models import (
     Entity,
     IngestionRun,
     MarketData,
+    SaiDaily,
     SentimentScore,
     Source,
     Topic,
@@ -283,3 +284,39 @@ def test_document_enriched_at_defaults_null(session: Session) -> None:
     doc, _ = _doc_and_entity(session)
     session.commit()
     assert doc.enriched_at is None  # unenriched until the NLP pipeline scans it
+
+
+def test_sai_daily_round_trip_and_composite_pk(session: Session) -> None:
+    _, ent = _doc_and_entity(session)
+    session.add(
+        SaiDaily(
+            entity_id=ent.id,
+            date=date(2026, 7, 3),
+            mention_growth=1.5,
+            sentiment_momentum=0.2,
+            topic_velocity=None,  # NULL = insufficient history, not zero
+            engagement_growth=-0.4,
+            sai_score=0.33,
+            sai_rank=1,
+        )
+    )
+    session.commit()
+
+    loaded = session.execute(select(SaiDaily)).scalar_one()
+    assert (loaded.entity_id, loaded.date) == (ent.id, date(2026, 7, 3))
+    assert loaded.topic_velocity is None
+    assert loaded.sai_rank == 1
+    assert loaded.computed_at is not None  # server default applied
+
+    # Core insert: dodges the ORM identity map so the DB constraint itself fires.
+    dup = insert(SaiDaily).values(entity_id=ent.id, date=date(2026, 7, 3), sai_score=0.9)
+    with pytest.raises(IntegrityError):  # same (entity_id, date) key
+        session.execute(dup)
+    session.rollback()
+
+
+def test_sai_daily_requires_valid_entity_fk(session: Session) -> None:
+    session.add(SaiDaily(entity_id=999, date=date(2026, 7, 3)))
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()

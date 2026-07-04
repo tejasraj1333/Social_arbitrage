@@ -19,6 +19,9 @@ Checks:
   enrichment_coverage  share of documents enriched by the NLP pipeline
                        (Phase 4; warns when a sizable corpus has zero
                        sentiment rows — pipeline rot).
+  sai_freshness        days the SAI panel trails its expected last closed
+                       day (Phase 5; a stalled panel starves the M5
+                       validation exactly like a stalled collector).
 
 Bot/spam scoring (blueprint W5) needs author-level Reddit data and joins
 this module once Reddit credentials land.
@@ -29,7 +32,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -41,6 +44,7 @@ from sam.storage.repositories import (
     DataQualityRepository,
     DocumentRepository,
     IngestionRunRepository,
+    SaiRepository,
     SourceRepository,
 )
 
@@ -67,6 +71,10 @@ COVERAGE_ROT_MIN_DOCS = 100
 # Unlike resolution, enrichment applies to (almost) every document — a large
 # backlog means the enrich stage stalled, which silently starves P5 signals.
 ENRICHMENT_BACKLOG_WARN = 0.5  # warn when >50% of the corpus is unenriched
+
+# A healthy daily chain leaves the panel at yesterday (lag 0). One missed run
+# self-heals on the next (the watermark backfills); two+ days means broken.
+SAI_STALE_WARN_DAYS = 2.0
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -256,6 +264,35 @@ def check_enrichment_coverage(session: Session) -> CheckOutcome:
     )
 
 
+def check_sai_freshness(session: Session, *, now: datetime | None = None) -> CheckOutcome:
+    """Days the SAI panel trails yesterday (its expected last closed day).
+
+    A missing panel is only a warning once a sizable linked corpus exists —
+    before that, "no rows yet" is the honest state of a young project, not
+    a failure.
+    """
+    now = now or datetime.now(tz=UTC)
+    latest = SaiRepository(session).latest_date()
+    _total, _unresolved, with_links = DocumentRepository(session).resolution_stats()
+    if latest is None:
+        sizable = with_links >= COVERAGE_ROT_MIN_DOCS
+        return CheckOutcome(
+            check_name="sai_freshness",
+            status="warn" if sizable else "pass",
+            value=None,
+            threshold=SAI_STALE_WARN_DAYS,
+            details={"reason": "no sai_daily rows", "linked_documents": with_links},
+        )
+    lag_days = float(((now.date() - timedelta(days=1)) - latest).days)
+    return CheckOutcome(
+        check_name="sai_freshness",
+        status="warn" if lag_days >= SAI_STALE_WARN_DAYS else "pass",
+        value=lag_days,
+        threshold=SAI_STALE_WARN_DAYS,
+        details={"latest_day": str(latest), "linked_documents": with_links},
+    )
+
+
 class DataQualityRunner:
     """Run all checks, persist their rows, and report the outcomes."""
 
@@ -271,6 +308,7 @@ class DataQualityRunner:
             outcomes.extend(check_volume_anomaly(session))
             outcomes.append(check_resolution_coverage(session))
             outcomes.append(check_enrichment_coverage(session))
+            outcomes.append(check_sai_freshness(session))
 
             DataQualityRepository(session).record([o.to_row() for o in outcomes])
             session.commit()

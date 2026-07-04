@@ -3,9 +3,10 @@
 M0 shipped ``entities``; Phase 2 (ingestion backbone) added ``sources``,
 ``documents``, ``market_data`` and ``ingestion_runs``; Phase 3 (entity
 resolution & quality) added ``document_entities`` and ``data_quality_checks``;
-Phase 4 (NLP enrichment) adds ``sentiment_scores``, ``embeddings``, ``topics``
-and ``document_topics`` per the target schema in docs/architecture.md. The
-rest (sai_daily, forecasts, ...) lands in later milestones.
+Phase 4 (NLP enrichment) added ``sentiment_scores``, ``embeddings``,
+``topics`` and ``document_topics``; Phase 5 (SAI) adds ``sai_daily`` per the
+target schema in docs/architecture.md. The rest (forecasts, reports, ...)
+lands in later milestones.
 
 Point-in-time rule: every fact row carries both the event time
 (``published_at`` / ``date``) and the known time (``ingested_at``). Backtests
@@ -269,6 +270,35 @@ class DocumentTopic(Base):
     document_id: Mapped[int] = mapped_column(BigIntPK, ForeignKey("documents.id"), primary_key=True)
     topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), primary_key=True)
     probability: Mapped[float] = mapped_column(Float)
+
+
+class SaiDaily(Base):
+    """One row of the Social Arbitrage Index panel: entity × closed UTC day.
+
+    Documents are bucketed by the *known* time (``ingested_at``), never the
+    event time — closed days are immutable (new documents can only land
+    "today"), which is what makes the P5 "deterministic rebuild from raw"
+    gate achievable. Components are nullable: a young panel has no trailing
+    baseline yet, and NULL means "insufficient history", not zero signal.
+    ``sai_score`` is the weighted mean of the components' cross-sectional
+    centered ranks; ``sai_rank`` ranks scores within the day (1 = strongest).
+    ``computed_at`` is the known time of the row (point-in-time rule).
+    """
+
+    __tablename__ = "sai_daily"
+    __table_args__ = (Index("ix_sai_daily_date", "date"),)
+
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entities.id"), primary_key=True)
+    date: Mapped[date] = mapped_column(Date, primary_key=True)
+    mention_growth: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sentiment_momentum: Mapped[float | None] = mapped_column(Float, nullable=True)
+    topic_velocity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    engagement_growth: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sai_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sai_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class DataQualityCheck(Base):

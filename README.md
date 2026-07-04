@@ -102,7 +102,8 @@ docs/           architecture.md, sai_methodology.md, adr/
 M0 Skeleton ✅ · M1 Full ingestion ✅ · M2 Entity resolution ✅ (precision 1.00
 on the labeled sample, gate ≥0.90 — see `docs/entity_resolution.md`) ·
 M3 NLP enrichment ✅ (FinBERT macro-F1 0.74, gate ≥0.70; embeddings → pgvector;
-versioned BERTopic — see `docs/nlp_enrichment.md`) · M4 SAI ·
+versioned BERTopic — see `docs/nlp_enrichment.md`) · M4 SAI ✅ (4 sub-signals →
+daily composite; deterministic rebuild verified — see `docs/sai_methodology.md`) ·
 **M5 Validation (kill-gate)** · M6 Forecasting · M7 Reporting ·
 M8 Serving/hardening · M9 Agentic (future). See `docs/architecture.md`.
 
@@ -114,6 +115,7 @@ sam ingest [--backfill]    # RSS/Yahoo/HN -> bronze lake + Postgres (idempotent)
 sam resolve [--all]        # link documents to entities (--evaluate: precision gate)
 sam enrich [--all]         # FinBERT sentiment + embeddings (--evaluate: F1 gate)
 sam topics                 # versioned BERTopic fit over stored embeddings
+sam sai [--rebuild]        # daily SAI panel over closed UTC days -> sai_daily
 sam dq                     # data-quality checks -> data_quality_checks
 sam runs [--limit N]       # ingestion audit trail
 ```

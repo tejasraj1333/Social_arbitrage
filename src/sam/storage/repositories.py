@@ -11,7 +11,7 @@ tests prove is the same mechanism production runs.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, cast
 
 from sqlalchemy import Table, func, select, update
@@ -30,6 +30,7 @@ from sam.storage.models import (
     Entity,
     IngestionRun,
     MarketData,
+    SaiDaily,
     SentimentScore,
     Source,
     Topic,
@@ -414,6 +415,168 @@ class TopicRepository:
         return list(
             self.session.execute(
                 select(Topic).where(Topic.topic_model_version == version).order_by(Topic.id)
+            ).scalars()
+        )
+
+    def versions(self) -> list[tuple[str, datetime]]:
+        """(version, created_at) per topic-model run, oldest first.
+
+        The SAI pipeline selects the version *as of* each panel day (latest
+        created_at <= end of day) — point-in-time rule. All rows of one run
+        share a created_at (single flush), so min() is just a formality.
+        """
+        rows = self.session.execute(
+            select(Topic.topic_model_version, func.min(Topic.created_at))
+            .group_by(Topic.topic_model_version)
+            .order_by(func.min(Topic.created_at), Topic.topic_model_version)
+        ).tuples()
+        return list(rows)
+
+
+class SignalInputRepository:
+    """Read-only joins feeding the SAI pipeline (Phase 5).
+
+    Rows come back id-ordered (deterministic) and *unfiltered by day*: UTC
+    day-bucketing and the staleness guard live in sam.signals.compute, in
+    Python — portable across SQLite/Postgres (no dialect-dependent date
+    truncation) and trivially unit-testable. Fine at the current corpus
+    scale; push the aggregation into SQL when Reddit-scale volume lands.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def linked_document_rows(
+        self, sentiment_model: str
+    ) -> list[tuple[int, int, float, datetime, datetime | None, dict[str, Any], float | None]]:
+        """One row per (document, entity) link, with the doc's sentiment.
+
+        (document_id, entity_id, confidence, ingested_at, published_at,
+        engagement, signed_sentiment). Sentiment is LEFT JOINed and pinned to
+        *one* model id — mixing model outputs would silently change signal
+        values; (label, score) is folded to a signed value in [-1, 1] here so
+        callers never see half a sentiment (None = not scored by this model
+        yet). Docs without links never appear: entities only accrue signal
+        from resolved mentions.
+        """
+        rows = self.session.execute(
+            select(
+                Document.id,
+                DocumentEntity.entity_id,
+                DocumentEntity.confidence,
+                Document.ingested_at,
+                Document.published_at,
+                Document.engagement,
+                SentimentScore.label,
+                SentimentScore.score,
+            )
+            .join(DocumentEntity, DocumentEntity.document_id == Document.id)
+            .outerjoin(
+                SentimentScore,
+                (SentimentScore.document_id == Document.id)
+                & (SentimentScore.model == sentiment_model),
+            )
+            .order_by(Document.id, DocumentEntity.entity_id)
+        ).tuples()
+        return [
+            (
+                doc_id,
+                entity_id,
+                confidence,
+                ingested_at,
+                published_at,
+                engagement or {},
+                None if label is None else _signed_sentiment(label, score),
+            )
+            for doc_id, entity_id, confidence, ingested_at, published_at, engagement, label, score in rows  # noqa: E501
+        ]
+
+    def topic_assignment_rows(
+        self,
+    ) -> list[tuple[int, datetime, datetime | None, int, str, float]]:
+        """One row per document→topic assignment, across *all* versions.
+
+        (document_id, ingested_at, published_at, topic_id, version,
+        probability). The pipeline picks the as-of version per panel day;
+        returning all versions keeps the query point-in-time agnostic.
+        """
+        rows = self.session.execute(
+            select(
+                Document.id,
+                Document.ingested_at,
+                Document.published_at,
+                DocumentTopic.topic_id,
+                Topic.topic_model_version,
+                DocumentTopic.probability,
+            )
+            .join(DocumentTopic, DocumentTopic.document_id == Document.id)
+            .join(Topic, Topic.id == DocumentTopic.topic_id)
+            .order_by(Document.id, DocumentTopic.topic_id)
+        ).tuples()
+        return list(rows)
+
+
+def _signed_sentiment(label: str, score: float) -> float:
+    """Fold (label, confidence) to one signed value in [-1, 1].
+
+    positive -> +score, negative -> -score, neutral -> 0.0 (a confident
+    'neutral' is absence of tone, not weak positivity).
+    """
+    if label == "positive":
+        return score
+    if label == "negative":
+        return -score
+    return 0.0
+
+
+class SaiRepository:
+    """sai_daily — the SAI pipeline's output panel."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_many(self, rows: list[dict[str, Any]]) -> int:
+        """Upsert panel rows on (entity_id, date); the latest compute wins.
+
+        DO UPDATE (not DO NOTHING): a rebuild after a config/model change
+        must refresh every value. Deterministic inputs mean a plain re-run
+        rewrites identical values (the P5 gate).
+        """
+        deduped: dict[tuple[int, Any], dict[str, Any]] = {
+            (row["entity_id"], row["date"]): row for row in rows
+        }
+        unique = list(deduped.values())
+        if not unique:
+            return 0
+
+        set_cols = [
+            "mention_growth",
+            "sentiment_momentum",
+            "topic_velocity",
+            "engagement_growth",
+            "sai_score",
+            "sai_rank",
+            "computed_at",
+        ]
+        written = 0
+        for chunk in _chunks(unique):
+            stmt = _insert_for(self.session, SaiDaily).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["entity_id", "date"],
+                set_={col: stmt.excluded[col] for col in set_cols},
+            )
+            written += _written_count(self.session, stmt, SaiDaily.__table__.c.entity_id)
+        return written
+
+    def latest_date(self) -> date | None:
+        """Most recent computed panel day (the incremental watermark)."""
+        return self.session.execute(select(func.max(SaiDaily.date))).scalar_one()
+
+    def rows_ordered(self) -> list[SaiDaily]:
+        """Full panel, (date, entity_id)-ordered — rebuild checks and tests."""
+        return list(
+            self.session.execute(
+                select(SaiDaily).order_by(SaiDaily.date, SaiDaily.entity_id)
             ).scalars()
         )
 

@@ -31,6 +31,7 @@ from sam.storage.models import (
     DocumentEntity,
     Embedding,
     MarketData,
+    SaiDaily,
     SentimentScore,
 )
 from sam.storage.repositories import (
@@ -40,6 +41,7 @@ from sam.storage.repositories import (
     EntityRepository,
     IngestionRunRepository,
     MarketDataRepository,
+    SaiRepository,
     SentimentRepository,
     SourceRepository,
     TopicRepository,
@@ -86,6 +88,7 @@ def pg_session(pg_engine) -> Iterator[Session]:
         # the search_path can never resolve these names to real public tables.
         for table in (
             "data_quality_checks",
+            "sai_daily",
             "document_topics",
             "topics",
             "embeddings",
@@ -242,6 +245,7 @@ def test_dq_runner_persists_on_postgres(pg_session: Session) -> None:
         "volume_anomaly",
         "resolution_coverage",
         "enrichment_coverage",
+        "sai_freshness",
     }
     rows = pg_session.execute(select(DataQualityCheck)).scalars().all()
     assert len(rows) == len(outcomes)
@@ -284,6 +288,36 @@ def test_sentiment_upsert_do_update_on_postgres(pg_session: Session) -> None:
     stored = pg_session.execute(select(SentimentScore)).scalar_one()
     assert (stored.label, stored.score) == ("negative", 0.95)
     assert stored.scored_at.tzinfo is not None  # timestamptz round-trip
+
+
+def test_sai_daily_upsert_do_update_on_postgres(pg_session: Session) -> None:
+    """Panel rebuild semantics on real Postgres: DO UPDATE refreshes values,
+    NULL components round-trip, and the date watermark reads back correctly."""
+    EntityRepository(pg_session).seed([{"ticker": "NVDA", "name": "NVIDIA Corporation"}])
+    ids = EntityRepository(pg_session).by_ticker()
+    repo = SaiRepository(pg_session)
+
+    row = {
+        "entity_id": ids["NVDA"],
+        "date": date(2026, 7, 3),
+        "mention_growth": 1.25,
+        "sentiment_momentum": None,  # insufficient history round-trips as NULL
+        "topic_velocity": None,
+        "engagement_growth": 0.0,
+        "sai_score": 0.5,
+        "sai_rank": 1,
+        "computed_at": datetime.now(tz=UTC),
+    }
+    assert repo.upsert_many([row]) == 1
+    # A rebuild refreshes in place (real Postgres ON CONFLICT DO UPDATE).
+    assert repo.upsert_many([dict(row, sai_score=-0.5, sai_rank=1)]) == 1
+    pg_session.commit()
+
+    stored = pg_session.execute(select(SaiDaily)).scalar_one()
+    assert (stored.sai_score, stored.sai_rank) == (-0.5, 1)
+    assert stored.sentiment_momentum is None
+    assert stored.computed_at.tzinfo is not None  # timestamptz round-trip
+    assert repo.latest_date() == date(2026, 7, 3)
 
 
 def test_topic_versioning_on_postgres(pg_session: Session) -> None:

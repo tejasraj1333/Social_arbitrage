@@ -76,6 +76,28 @@ class NLPSettings(BaseModel):
     topics_min_docs: int = 50
 
 
+class SignalSettings(BaseModel):
+    """SAI computation (Phase 5). These knobs change signal *values*, so any
+    edit requires ``sam sai --rebuild`` to keep the panel internally
+    consistent (documented in docs/sai_methodology.md)."""
+
+    # Trailing baseline window (days) for the growth/momentum transforms.
+    window_days: int = 7
+    # Days of panel history required before a growth value is emitted;
+    # below this the component is NULL ("insufficient history", not 0).
+    min_history_days: int = 3
+    # Documents whose published_at predates ingestion by more than this many
+    # days are excluded from all day-aggregates — a late backfill is not an
+    # attention spike. Docs without published_at are treated as fresh.
+    max_doc_age_days: int = 7
+    # Composite weights over the four components' centered ranks; weights of
+    # NULL components are renormalized away rather than treated as zeros.
+    weight_mentions: float = 0.25
+    weight_sentiment: float = 0.25
+    weight_topics: float = 0.25
+    weight_engagement: float = 0.25
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SAM_",
@@ -96,6 +118,7 @@ class Settings(BaseSettings):
     kaggle: KaggleSettings = Field(default_factory=KaggleSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     nlp: NLPSettings = Field(default_factory=NLPSettings)
+    signals: SignalSettings = Field(default_factory=SignalSettings)
 
     @classmethod
     def settings_customise_sources(
